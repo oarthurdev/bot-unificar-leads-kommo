@@ -26,6 +26,9 @@ module.exports = {
   pipelineDestino: process.env.PIPELINE_DESTINO || '12347316',
   statusDestino: process.env.STATUS_DESTINO || '',
 
+  // Abas simultâneas na fase 2 (verificar/mover leads após a união)
+  concorrenciaFase2: Math.max(1, parseInt(process.env.CONCORRENCIA_FASE2 || '3', 10)),
+
   paths: {
     dataDir: DATA_DIR,
     storageState: path.join(DATA_DIR, 'storageState.json'),

@@ -27,6 +27,10 @@ async function main() {
       await require('./src/merge').merge();
       break;
 
+    case 'turbo':
+      await require('./src/turbo').turbo();
+      break;
+
     case 'status': {
       const estado = lerJson(cfg.paths.estado, { totalUnificados: 0, pendentesMover: [], movidos: [], falhas: [] });
       log('=============== STATUS ===============');

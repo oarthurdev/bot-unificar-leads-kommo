@@ -29,12 +29,12 @@ async function merge() {
     falhas: [],
   });
 
-  const { browser, page } = await abrirNavegador();
+  const { browser, context, page } = await abrirNavegador();
   try {
     // Retoma pendências de execuções anteriores antes de unir mais
     if (!cfg.dryRun && estado.pendentesMover.length > 0) {
       log(`Retomando: ${estado.pendentesMover.length} grupos aguardando tratamento pós-união...`);
-      await moverPendentes(page, estado);
+      await moverPendentes(context, page, estado);
     }
 
     let abriu = await abrirAssistente(page);
@@ -45,6 +45,7 @@ async function merge() {
 
     const limite = cfg.batchSize > 0 ? cfg.batchSize : Infinity;
     let processadas = 0;
+    const inicioLote = Date.now();
 
     while (processadas < limite) {
       let tela = await lerTela(page);
@@ -59,10 +60,9 @@ async function merge() {
       const resumoTela = tela.subgrupos
         .map((s) => `[${s.nomes.join(' + ')}] → mantém #${s.idNovo} (${s.dataNova})`)
         .join(' | ');
-      log(`Duplicata ${tela.atual} de ${tela.total} (${processadas + 1}/${limite === Infinity ? tela.total : limite} do lote): ${resumoTela}`);
+      log(`Duplicata ${tela.atual} de ${tela.total} (${processadas + 1}${limite === Infinity ? '' : `/${limite}`} do lote): ${resumoTela}`);
 
-      const clicados = await selecionarMaisRecentes(page, tela);
-      log(`  ${clicados} campos apontados para o(s) lead(s) mais recente(s).`);
+      await selecionarMaisRecentes(page, tela);
 
       if (cfg.dryRun) {
         await page.screenshot({ path: 'data/dry-run-selecao.png' }).catch(() => {});
@@ -86,6 +86,14 @@ async function merge() {
       processadas++;
       salvarJson(cfg.paths.estado, estado);
 
+      // ETA a cada 10 uniões
+      if (processadas % 10 === 0) {
+        const mediaSeg = (Date.now() - inicioLote) / 1000 / processadas;
+        const restantes = Math.max(0, (tela.total || 0) - 1);
+        const etaMin = Math.round((restantes * mediaSeg) / 60);
+        log(`  >>> ${processadas} uniões nesta execução (${mediaSeg.toFixed(1)}s/união). Restam ~${restantes} duplicatas (~${etaMin} min).`);
+      }
+
       await esperarProximaTela(page, assinaturaAntes);
       await dormir(cfg.pausaEntreGruposMs);
     }
@@ -97,8 +105,8 @@ async function merge() {
 
     // FASE 2
     if (!cfg.dryRun && estado.pendentesMover.length > 0) {
-      log(`FASE 2: tratando ${estado.pendentesMover.length} grupos unificados (antigo → funil ${cfg.pipelineDestino}; o mais recente fica)...`);
-      await moverPendentes(page, estado);
+      log(`FASE 2: tratando ${estado.pendentesMover.length} grupos unificados em ${cfg.concorrenciaFase2} abas paralelas (antigo → funil ${cfg.pipelineDestino}; o mais recente fica)...`);
+      await moverPendentes(context, page, estado);
     }
   } finally {
     salvarJson(cfg.paths.estado, estado);
@@ -121,7 +129,8 @@ function resumo(estado) {
 async function abrirAssistente(page) {
   log('Abrindo o funil e o assistente "Localizar duplicatas"...');
   await page.goto(`${cfg.baseUrl}/leads/pipeline/`, { waitUntil: 'domcontentloaded' });
-  await dormir(5000);
+  await page.waitForSelector(sel.botaoMenuMais[0], { timeout: cfg.timeoutMs }).catch(() => {});
+  await dormir(1200); // handlers do menu terminam de montar
   await garantirLogado(page);
 
   let clicouMenu = false;
@@ -134,7 +143,7 @@ async function abrirAssistente(page) {
     }
   }
   if (!clicouMenu) throw new Error('botão "..." do funil não encontrado (sel.botaoMenuMais)');
-  await dormir(800);
+  await dormir(600);
 
   const item = page.locator(sel.itemContextMenu, { hasText: sel.textoLocalizarDuplicatas }).first();
   if (await item.count() === 0) throw new Error('item "Localizar duplicatas" não encontrado no menu');
@@ -145,7 +154,7 @@ async function abrirAssistente(page) {
   } catch (_) {
     return false; // sem duplicatas, o assistente pode nem abrir
   }
-  await dormir(2500);
+  await dormir(1200);
   return true;
 }
 
@@ -245,7 +254,7 @@ async function esperarProximaTela(page, assinaturaAntes) {
   let semFormSeguidas = 0;
 
   while (Date.now() < prazo) {
-    await dormir(1500);
+    await dormir(600);
     const ids = await page.evaluate((formSel) => {
       const form = document.querySelector(formSel);
       if (!form) return null;
@@ -255,7 +264,7 @@ async function esperarProximaTela(page, assinaturaAntes) {
     if (ids && ids !== assinaturaAntes) return true;   // próxima tela carregou
     if (ids === null || ids === '') {
       semFormSeguidas++;
-      if (semFormSeguidas >= 5) return false;          // ~8s sem form → assistente fechou
+      if (semFormSeguidas >= 14) return false;         // ~8s sem form → assistente fechou
     } else {
       semFormSeguidas = 0;                             // form ainda com a tela antiga (processando)
     }
@@ -263,21 +272,49 @@ async function esperarProximaTela(page, assinaturaAntes) {
   throw new Error('tempo esgotado aguardando o assistente avançar após "Unir esta duplicata"');
 }
 
-/** FASE 2: para cada grupo unido, move o(s) lead(s) ANTIGO(s) remanescentes. */
-async function moverPendentes(page, estado) {
+/**
+ * FASE 2: para cada grupo unido, move o(s) lead(s) ANTIGO(s) remanescentes.
+ * Roda em CONCORRENCIA_FASE2 abas paralelas para acelerar (cada grupo exige
+ * 1–2 aberturas de card, que é o passo mais lento do fluxo).
+ */
+async function moverPendentes(context, pagePrincipal, estado) {
   const fila = [...estado.pendentesMover];
-  for (const item of fila) {
-    try {
-      const detalhes = await tratarGrupoAposUniao(page, item);
-      estado.movidos.push({ ...item, detalhes, quando: new Date().toISOString() });
-      estado.pendentesMover = estado.pendentesMover.filter((p) => p !== item);
-      log(`  Grupo "${item.nomes.join(' + ')}": ${detalhes.map((d) => `#${d.leadId} ${d.acao}`).join('; ')}`);
-    } catch (e) {
-      log(`  FALHA no grupo [${item.ids.join(',')}]: ${e.message} (re-tentado na próxima execução)`);
-      estado.falhas.push({ ...item, erro: e.message, quando: new Date().toISOString() });
+  const total = fila.length;
+  let cursor = 0;
+  let tratados = 0;
+  const inicio = Date.now();
+
+  const trabalhador = async (pg) => {
+    while (true) {
+      const item = fila[cursor++];
+      if (!item) return;
+      try {
+        const detalhes = await tratarGrupoAposUniao(pg, item);
+        estado.movidos.push({ ...item, detalhes, quando: new Date().toISOString() });
+        estado.pendentesMover = estado.pendentesMover.filter((p) => p !== item);
+        log(`  [${++tratados}/${total}] "${item.nomes.join(' + ')}": ${detalhes.map((d) => `#${d.leadId} ${d.acao}`).join('; ')}`);
+      } catch (e) {
+        tratados++;
+        log(`  FALHA no grupo [${item.ids.join(',')}]: ${e.message} (re-tentado na próxima execução)`);
+        estado.falhas.push({ ...item, erro: e.message, quando: new Date().toISOString() });
+      }
+      salvarJson(cfg.paths.estado, estado);
+      if (tratados % 20 === 0 && tratados > 0) {
+        const mediaSeg = (Date.now() - inicio) / 1000 / tratados;
+        log(`  >>> fase 2: ${tratados}/${total} grupos (~${Math.round(((total - tratados) * mediaSeg) / 60)} min restantes)`);
+      }
     }
-    salvarJson(cfg.paths.estado, estado);
-    await dormir(400);
+  };
+
+  const nAbas = Math.min(cfg.concorrenciaFase2, Math.max(1, total));
+  const abasExtras = [];
+  for (let i = 1; i < nAbas; i++) abasExtras.push(await context.newPage());
+  const abas = [pagePrincipal, ...abasExtras];
+
+  try {
+    await Promise.all(abas.map((pg) => trabalhador(pg)));
+  } finally {
+    for (const pg of abasExtras) await pg.close().catch(() => {});
   }
 }
 
@@ -291,36 +328,57 @@ async function moverPendentes(page, estado) {
  */
 async function tratarGrupoAposUniao(page, item) {
   const detalhes = [];
+  const antigos = item.ids.filter((i) => i && i !== item.idNovo);
 
   const novoExiste = await leadExiste(page, item.idNovo);
-  if (!novoExiste) {
-    detalhes.push({ leadId: item.idNovo, acao: 'NÃO encontrado — união manteve outro ID; nada movido (conferir manualmente)' });
+  if (novoExiste) {
+    detalhes.push({ leadId: item.idNovo, acao: 'mais recente, mantido onde está' });
+    for (const leadId of antigos) {
+      const existe = await leadExiste(page, leadId);
+      if (!existe) {
+        detalhes.push({ leadId, acao: 'absorvido pela união (não existe mais)' });
+        continue;
+      }
+      await moverParaFunilDestino(page, leadId); // a página já está no card do lead
+      detalhes.push({ leadId, acao: `movido para o funil ${cfg.pipelineDestino}` });
+    }
     return detalhes;
   }
-  detalhes.push({ leadId: item.idNovo, acao: 'mais recente, mantido onde está' });
 
-  const antigos = item.ids.filter((i) => i && i !== item.idNovo);
+  // idNovo não existe: a união pode ter mantido o ID antigo. Nesse caso o lead
+  // sobrevivente É o resultado unificado (com os dados do mais recente que
+  // selecionamos no assistente) — ele fica onde está, nada é movido.
   for (const leadId of antigos) {
-    const existe = await leadExiste(page, leadId);
-    if (!existe) {
+    if (await leadExiste(page, leadId)) {
+      detalhes.push({ leadId, acao: `é o lead unificado (união manteve o ID antigo; dados do mais recente #${item.idNovo}) — mantido onde está` });
+    } else {
       detalhes.push({ leadId, acao: 'absorvido pela união (não existe mais)' });
-      continue;
     }
-    await moverParaFunilDestino(page, leadId); // a página já está no card do lead
-    detalhes.push({ leadId, acao: `movido para o funil ${cfg.pipelineDestino}` });
+  }
+  if (!detalhes.some((d) => d.acao.includes('unificado'))) {
+    detalhes.push({ leadId: item.idNovo, acao: 'nenhum ID do grupo localizado — conferir manualmente' });
   }
   return detalhes;
 }
 
 /** Abre o card do lead e verifica se ele existe (aguarda o widget de funil). */
 async function leadExiste(page, leadId) {
-  await page.goto(`${cfg.baseUrl}/leads/detail/${leadId}`, { waitUntil: 'domcontentloaded' });
+  // timeout de navegação próprio (independente do TIMEOUT_MS de elementos) + 1 re-tentativa
+  for (let tentativa = 0; tentativa < 2; tentativa++) {
+    try {
+      await page.goto(`${cfg.baseUrl}/leads/detail/${leadId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      break;
+    } catch (e) {
+      if (tentativa === 1) throw new Error(`navegação para o lead #${leadId} falhou: ${e.message.split('\n')[0]}`);
+      await dormir(1000);
+    }
+  }
   const prazo = Date.now() + 9000;
   while (Date.now() < prazo) {
     if (!page.url().includes(`/leads/detail/${leadId}`)) return false; // redirecionado = não existe
     const temWidget = await page.locator(sel.seletorFunilCard).first().isVisible().catch(() => false);
     if (temWidget) return true;
-    await dormir(700);
+    await dormir(500);
   }
   return false;
 }
@@ -378,4 +436,4 @@ async function moverParaFunilDestino(page, leadId) {
   }
 }
 
-module.exports = { merge };
+module.exports = { merge, abrirAssistente, lerTela, selecionarMaisRecentes, esperarProximaTela, moverPendentes };

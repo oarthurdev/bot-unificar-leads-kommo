@@ -1,17 +1,18 @@
-{
-  "name": "bot-unificar-leads-kommo",
-  "version": "1.0.0",
-  "description": "Bot Playwright para unificar leads duplicados na Kommo CRM via interface web, em lotes, mantendo o lead mais recente.",
-  "main": "bot.js",
-  "type": "commonjs",
-  "scripts": {
-    "login": "node bot.js login",
-    "scan": "node bot.js scan",
-    "merge": "node bot.js merge",
-    "status": "node bot.js status"
-  },
-  "dependencies": {
-    "dotenv": "^16.4.5",
-    "playwright": "^1.47.0"
-  }
+﻿{
+    "name":  "bot-unificar-leads-kommo",
+    "version":  "1.0.0",
+    "description":  "Bot Playwright para unificar leads duplicados na Kommo CRM via interface web, em lotes, mantendo o lead mais recente.",
+    "main":  "bot.js",
+    "type":  "commonjs",
+    "scripts":  {
+                    "login":  "node bot.js login",
+                    "scan":  "node bot.js scan",
+                    "merge":  "node bot.js merge",
+                    "status":  "node bot.js status",
+                    "turbo":  "node bot.js turbo"
+                },
+    "dependencies":  {
+                         "dotenv":  "^16.4.5",
+                         "playwright":  "^1.47.0"
+                     }
 }
