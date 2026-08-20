@@ -29,6 +29,14 @@ module.exports = {
   // Abas simultâneas na fase 2 (verificar/mover leads após a união)
   concorrenciaFase2: Math.max(1, parseInt(process.env.CONCORRENCIA_FASE2 || '3', 10)),
 
+  // Regras por funil:
+  //  - todos os leads do grupo no funil de VENDAS → pular (não unificar)
+  //  - exatamente 1 no funil de vendas e nenhum no SDR → unificar PARA o funil
+  //    de vendas (etapa do lead de vendas), com os dados do lead mais recente
+  //  - qualquer lead no SDR → pular (leads do SDR ficam onde estão)
+  pipelineVendas: process.env.PIPELINE_VENDAS || '8865067',
+  pipelineSDR: process.env.PIPELINE_SDR || '14237704',
+
   paths: {
     dataDir: DATA_DIR,
     storageState: path.join(DATA_DIR, 'storageState.json'),

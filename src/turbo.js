@@ -1,7 +1,12 @@
+const fs = require('fs');
+const path = require('path');
 const cfg = require('./config');
+const sel = require('./seletores');
 const { abrirNavegador, garantirLogado } = require('./navegador');
 const { log, lerJson, salvarJson, dormir } = require('./util');
-const { moverPendentes } = require('./merge');
+const { moverPendentes, abrirAssistente } = require('./merge');
+
+const ARQUIVO_SKIP = path.join(cfg.paths.dataDir, 'skip-request.json');
 
 /**
  * MODO TURBO: reproduz as requisições AJAX que o próprio assistente
@@ -27,7 +32,9 @@ async function turbo() {
     pendentesMover: [],
     movidos: [],
     falhas: [],
+    pulados: [],
   });
+  if (!estado.pulados) estado.pulados = [];
 
   const { browser, context, page } = await abrirNavegador();
   const api = context.request;
@@ -90,9 +97,30 @@ async function turbo() {
         contatosInfo = (await rc.json().catch(() => null))?.response || null;
       }
 
-      // 3) Monta o payload com a regra "mais recente vence"
+      // 3) Aplica as regras por funil
+      const decisao = decidirGrupo(double, leadsInfo);
+      const rotulo = decisao.nomes.filter(Boolean).join(' + ') || decisao.ids.join(' + ');
+
+      if (decisao.acao === 'pular') {
+        log(`Pulando grupo [${rotulo}]: ${decisao.motivo} (restam ~${Math.max(0, total - processadas)})`);
+        if (cfg.dryRun) {
+          log('[DRY_RUN] O grupo seria pulado (marcado como "não duplicata" na Kommo). Nada foi feito.');
+          break;
+        }
+        await pularGrupo(api, HPOST, page, double);
+        estado.pulados.push({ ids: decisao.ids, nomes: decisao.nomes, motivo: decisao.motivo, quando: new Date().toISOString() });
+        salvarJson(cfg.paths.estado, estado);
+        continue;
+      }
+
+      // 4) Monta o payload com a regra "mais recente vence"
       const { params, idNovo, ids, nomes } = montarPayload(double, leadsInfo, contatosInfo);
-      log(`União ${processadas + 1}${limite === Infinity ? '' : `/${limite}`} (restam ~${Math.max(0, total - processadas)}): [${nomes.filter(Boolean).join(' + ') || ids.join(' + ')}] → mantém #${idNovo}`);
+      if (decisao.acao === 'unir-vendas') {
+        // resultado vai para o funil de vendas, na etapa do lead que já está lá
+        params.set('result_element[STATUS]', decisao.statusVendas);
+        params.set('result_element[PIPELINE_ID]', cfg.pipelineVendas);
+      }
+      log(`União ${processadas + 1}${limite === Infinity ? '' : `/${limite}`} (restam ~${Math.max(0, total - processadas)}): [${nomes.filter(Boolean).join(' + ') || ids.join(' + ')}] → mantém #${idNovo}${decisao.acao === 'unir-vendas' ? ` NO FUNIL DE VENDAS (etapa do lead #${decisao.idVendas})` : ''}`);
 
       if (cfg.dryRun) {
         log('[DRY_RUN] Payload montado e validado — NADA foi enviado. Amostra:');
@@ -139,10 +167,143 @@ async function turbo() {
 
   log('================ RESUMO ================');
   log(`Duplicatas unificadas (total acumulado): ${estado.totalUnificados}`);
+  log(`Grupos pulados pelas regras de funil:    ${estado.pulados.length}`);
   log(`Grupos tratados na fase 2:               ${estado.movidos.length}`);
   log(`Grupos aguardando fase 2:                ${estado.pendentesMover.length}`);
   log(`Falhas registradas:                      ${estado.falhas.length}`);
   if (cfg.dryRun) log('DRY_RUN estava ativo: nada foi alterado.');
+}
+
+/**
+ * Regras por funil:
+ *  - todos no funil de VENDAS            → pular
+ *  - 2+ no funil de vendas (mas não todos) → pular (ambíguo, não mexe)
+ *  - algum lead no SDR                   → pular (SDR fica onde está)
+ *  - exatamente 1 no funil de vendas     → unir PARA o funil de vendas
+ *  - nenhum no funil de vendas           → unir normal (mais recente vence)
+ */
+function decidirGrupo(double, leadsInfo) {
+  const ids = (leadsInfo.elements || double.leads).map(String);
+  const nomes = ids.map((id) => leadsInfo.compare_values?.NAME?.[id]?.values?.[0]?.label || '');
+  const pipelineDe = (id) => String(leadsInfo.compare_values?.PIPELINE_ID?.[id]?.values?.[0]?.value || '');
+  const statusDe = (id) => String(leadsInfo.compare_values?.STATUS?.[id]?.values?.[0]?.value || '');
+
+  const emVendas = ids.filter((id) => pipelineDe(id) === String(cfg.pipelineVendas));
+  const emSDR = ids.filter((id) => pipelineDe(id) === String(cfg.pipelineSDR));
+
+  if (emVendas.length === ids.length) {
+    return { acao: 'pular', motivo: 'todos os leads já estão no funil de vendas', ids, nomes };
+  }
+  if (emSDR.length > 0) {
+    return { acao: 'pular', motivo: `lead(s) no funil SDR (${emSDR.map((i) => '#' + i).join(', ')}) — ficam onde estão`, ids, nomes };
+  }
+  if (emVendas.length === 1) {
+    return { acao: 'unir-vendas', idVendas: emVendas[0], statusVendas: statusDe(emVendas[0]), ids, nomes };
+  }
+  if (emVendas.length > 1) {
+    return { acao: 'pular', motivo: `${emVendas.length} leads no funil de vendas e outros fora — ambíguo, não mexer`, ids, nomes };
+  }
+  return { acao: 'unir', ids, nomes };
+}
+
+/**
+ * Pula o grupo atual (equivale ao botão "Pular esta duplicata" — a Kommo marca
+ * o grupo como "não duplicata" e a fila avança). Na primeira vez, captura a
+ * requisição real clicando no botão pela interface; depois replica direto.
+ */
+async function pularGrupo(api, HPOST, page, double) {
+  let template = fs.existsSync(ARQUIVO_SKIP) ? lerJson(ARQUIVO_SKIP, null) : null;
+
+  if (template) {
+    const { url, data, ehJson } = montarSkipReplay(template, double);
+    const headers = ehJson
+      ? { ...HPOST, 'content-type': 'application/json' }
+      : HPOST;
+    const r = template.metodo === 'GET'
+      ? await api.get(url, { headers })
+      : await api.post(url, { headers, data });
+    if (r.status() >= 400) throw new Error(`skip replicado falhou (HTTP ${r.status()})`);
+    await dormir(400);
+    return;
+  }
+
+  // Primeira vez: captura via interface
+  log('  (primeira pulada: capturando a requisição do botão "Pular esta duplicata"...)');
+  const capturadas = [];
+  const ouvinte = (req) => {
+    if (req.method() !== 'GET' && /doubl|merge|skip|ignore/i.test(req.url())) {
+      capturadas.push({ metodo: req.method(), url: req.url(), postData: req.postData() || '' });
+    }
+  };
+  page.on('request', ouvinte);
+  try {
+    const abriu = await abrirAssistente(page);
+    if (!abriu) throw new Error('assistente não abriu para capturar o botão Pular');
+    await page.locator(sel.botaoPular).first().click();
+    await dormir(4000);
+    await page.locator(sel.botaoCancelar).first().click().catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
+  } finally {
+    page.off('request', ouvinte);
+  }
+
+  const skipReq = capturadas.find((c) => !/\/merge\/(leads|contacts)\/info|\/merge\/leads\/save/.test(c.url));
+  if (!skipReq) throw new Error(`não capturei a requisição de pular (vistas: ${capturadas.map((c) => c.url).join(' | ') || 'nenhuma'})`);
+  fs.writeFileSync(ARQUIVO_SKIP, JSON.stringify(skipReq, null, 2), 'utf8');
+  log(`  requisição de pular capturada: ${skipReq.metodo} ${skipReq.url.slice(0, 100)}`);
+  // O clique na interface já pulou o grupo atual — nada mais a fazer.
+}
+
+/** Reconstrói a requisição de pular para o grupo atual (substitui uuids/ids). */
+function montarSkipReplay(template, double) {
+  const RE_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+  const uuids = double.group_uuids || [];
+  let url = template.url;
+  if (RE_UUID.test(url) && uuids.length) url = url.replace(RE_UUID, uuids[0]);
+
+  let data = template.postData || '';
+  const ehJson = /^\s*[{[]/.test(data);
+  if (ehJson) {
+    // corpo JSON: troca uuids e listas de ids pelo grupo atual
+    let iUuid = 0;
+    data = data.replace(RE_UUID, () => uuids[Math.min(iUuid++, Math.max(0, uuids.length - 1))] || '');
+    try {
+      const obj = JSON.parse(data);
+      const trocarIds = (o) => {
+        for (const k of Object.keys(o)) {
+          if (Array.isArray(o[k]) && o[k].every((x) => /^\d+$/.test(String(x)))) {
+            if (/lead/i.test(k) || k === 'id' || k === 'ids' || k === 'elements') o[k] = double.leads;
+            else if (/contact/i.test(k)) o[k] = double.contacts || o[k];
+          } else if (o[k] && typeof o[k] === 'object') trocarIds(o[k]);
+        }
+      };
+      trocarIds(obj);
+      data = JSON.stringify(obj);
+    } catch (_) { /* mantém a substituição só de uuids */ }
+    return { url, data, ehJson };
+  }
+  if (data) {
+    const antigos = new URLSearchParams(data);
+    const novos = new URLSearchParams();
+    let iUuid = 0;
+    for (const [k, v] of antigos) {
+      if (RE_UUID.test(String(v))) {
+        RE_UUID.lastIndex = 0;
+        novos.append(k, uuids[Math.min(iUuid++, uuids.length - 1)] || v);
+      } else if (k === 'id[]' || /\[leads\]\[\]$/.test(k)) {
+        // ids dos leads do grupo atual
+        continue; // adicionados abaixo, uma vez só
+      } else {
+        novos.append(k, v);
+      }
+      RE_UUID.lastIndex = 0;
+    }
+    if ([...new URLSearchParams(template.postData)].some(([k]) => k === 'id[]')) {
+      double.leads.forEach((id) => novos.append('id[]', String(id)));
+    }
+    data = novos.toString();
+  }
+  return { url, data, ehJson: false };
 }
 
 /** Monta o form-data do save escolhendo o lead/contato mais recente como vencedor. */
