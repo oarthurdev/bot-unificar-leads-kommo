@@ -1,83 +1,47 @@
 /**
- * Seletores da interface web da Kommo (baseada no front do amoCRM).
- * Cada entrada é uma LISTA de candidatos — o bot usa o primeiro que existir na página.
- * Se a Kommo mudar o layout, ajuste apenas este arquivo.
+ * Seletores REAIS da interface web da Kommo (conta dicasaindaial, calibrados
+ * em 20/08/2026 via tools/inspecionar-*.js). Se a Kommo mudar o layout,
+ * ajuste apenas este arquivo.
  */
 module.exports = {
-  // Linha de lead na lista (/leads/list/)
-  linhaLead: [
-    '.list__body-right__wrapper .js-list-row',
-    'tr.list-row[data-id]',
-    '.list__row[data-id]',
-    '[data-entity="leads"] [data-id].js-list-row',
+  // ===== Funil (pipeline) =====
+  // Botão "..." no topo do funil, que abre o context-menu
+  botaoMenuMais: [
+    '.button-input-more button.button-input-with-menu',
+    '.list-top-nav__button-more button',
+    '.list-top-nav__button-more',
   ],
+  // Item do context-menu (filtrar por texto "Localizar duplicatas")
+  itemContextMenu: '.button-input__context-menu__item',
+  textoLocalizarDuplicatas: /localizar duplicatas/i,
 
-  // Célula/link com o nome do lead dentro da linha
-  nomeLead: [
-    '.list__body-right__row__link',
-    'a[href*="/leads/detail/"]',
-    '.js-navigate-link',
-  ],
+  // ===== Assistente "Localizar e unir duplicatas" =====
+  // Título: <h2 class="modal-body__caption head_2">Localizar e unir duplicatas — 1 de 993</h2>
+  tituloAssistente: 'h2.modal-body__caption',
+  formAssistente: '.js-merge-form',
+  botaoUnir: '.js-merge-start',        // "Unir esta duplicata"
+  botaoPular: '.js-merge-next',        // "Pular esta duplicata" (marca como NÃO duplicata — evitar!)
+  botaoCancelar: 'button.button-cancel', // "Cancelar" — fecha sem efeito
+  // Dentro do form:
+  //   inputs hidden  name="id[]"                      → IDs dos leads, na ordem das colunas
+  //   radios         name="[prefixo]result_element[CAMPO]" → opções na ordem das colunas
+  //   grupo DATE_CREATE tem as datas de criação como value ("YYYY-MM-DD HH:MM:SS")
+  //   checkboxes     result_element[TAGS][] / [cfv]…  → união de tags/contatos (manter marcados)
+  //   checkbox       name="merge_switcher"            → toggle "Unir" de cada subgrupo
 
-  // Checkbox de seleção dentro da linha
-  checkboxLinha: [
-    'input[type="checkbox"]',
-    '.control--checkbox',
-    '.js-item-checkbox',
-  ],
+  // ===== Card do lead (mover de funil) =====
+  seletorFunilCard: '.pipeline-select-view',            // widget clicável no topo do card
+  funilAtualAttr: '.pipeline-select-view__inner',       // data-pipeline-id = funil atual
+  dropdownFunil: '.pipeline-select-wrapper__inner__container',
+  // Etapa: label.pipeline-select__dropdown__item__label[for^="pipeline_<PIPELINE>_<STATUS>_"]
+  // Etapas finais do sistema têm status 142 (ganho) e 143 (perdido) — não usar como destino padrão
 
-  // Campo de busca global / da lista
-  campoBusca: [
-    'input.js-search-input',
-    '#search_input',
-    'input[type="search"]',
-    'input[placeholder*="usca"]',
-    'input[placeholder*="earch"]',
-  ],
+  // ===== Lista de leads (usada pelo scan, opcional) =====
+  linhaLead: ['.js-list-row[data-id]'],
+  nomeLead: ['a.list-row__template-name__table-wrapper__name-link', 'a[href*="/leads/detail/"]'],
+  checkboxLinha: ['label.control-checkbox'],
+  campoBusca: ['#search_input'],
 
-  // Barra de ações que aparece ao selecionar linhas
-  barraAcoes: [
-    '.list-actions',
-    '.js-list-actions',
-    '.list__body-right__top__actions',
-  ],
-
-  // Botão "..." / mais ações (a unificação às vezes fica dentro dele)
-  botaoMais: [
-    '.js-list-actions-more',
-    '.list-actions__more',
-    'button:has-text("...")',
-  ],
-
-  // Botão de unificar/mesclar na barra de ações (fallback: busca por texto)
-  botaoUnificar: [
-    '.js-merge',
-    '.js-list-merge',
-    '#list_actions_merge',
-  ],
-  textosUnificar: /unificar|mesclar|merge|combinar/i,
-
-  // Modal de unificação
-  modalUnificacao: [
-    '.modal.merge',
-    '.merge-modal',
-    '.modal:has-text("nificar")',
-    '.modal:has-text("erge")',
-  ],
-
-  // Botão de confirmação dentro do modal
-  botaoConfirmarModal: [
-    '.js-merge-save',
-    '.merge__save',
-    'button[type="submit"]',
-  ],
-  textosConfirmar: /^(unificar|mesclar|merge|salvar|save|confirmar)$/i,
-
-  // Indicador de que o usuário está logado (menu lateral do CRM)
-  indicadorLogado: [
-    '#nav_menu',
-    '.nav__menu',
-    'aside .nav',
-    '[data-entity="leads"]',
-  ],
+  // Indicador de sessão logada
+  indicadorLogado: ['#nav_menu', '.nav__menu', 'aside .nav', '[data-entity="leads"]', '.pipeline_leads__quick_add_button'],
 };

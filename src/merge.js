@@ -1,267 +1,329 @@
 const cfg = require('./config');
 const sel = require('./seletores');
-const { abrirNavegador, primeiro, garantirLogado } = require('./navegador');
-const { log, lerJson, salvarJson, normalizarNome, dormir } = require('./util');
+const { abrirNavegador, garantirLogado } = require('./navegador');
+const { log, lerJson, salvarJson, dormir } = require('./util');
 
 /**
- * Unifica os grupos de data/duplicados.json em lotes, pela interface web:
- *   1. Busca o nome do lead na lista
- *   2. Marca os checkboxes das linhas duplicadas (até MAX_LEADS_POR_UNIFICACAO por vez)
- *   3. Clica em "Unificar/Mesclar" e, no modal, prioriza os valores do lead MAIS RECENTE
- *   4. Confirma e repete até sobrar 1 lead com aquele nome
+ * Unifica duplicatas pelo assistente nativo da Kommo:
+ *   Funil → menu "..." → "Localizar duplicatas"
  *
- * Progresso fica em data/estado.json — pode interromper (Ctrl+C) e rodar de novo
- * que ele continua de onde parou. BATCH_SIZE controla quantos grupos por execução.
+ * Em cada tela do assistente:
+ *   1. Lê os subgrupos de duplicatas (radios name="[prefixo]result_element[CAMPO]",
+ *      opções na ordem das colunas; hidden name="id[]" = IDs dos leads na mesma ordem)
+ *   2. Compara as datas do grupo DATE_CREATE e seleciona, em TODOS os campos,
+ *      a coluna do lead criado MAIS RECENTEMENTE
+ *   3. Clica "Unir esta duplicata" e espera a próxima tela
+ *
+ * Depois do lote, FASE 2: cada lead unificado é movido para o funil
+ * PIPELINE_DESTINO (12347316, etapa "Deletar" por padrão).
+ *
+ * Progresso em data/estado.json (retomável). BATCH_SIZE = duplicatas por execução.
+ * DRY_RUN=true: analisa e seleciona a 1ª tela SEM unir (o botão "Pular" marca o
+ * par como não-duplicata permanentemente, então a simulação não avança telas).
  */
 async function merge() {
-  const duplicados = lerJson(cfg.paths.duplicados, null);
-  if (!duplicados || !duplicados.length) {
-    throw new Error('data/duplicados.json vazio ou inexistente. Rode antes: npm run scan');
-  }
-
-  const estado = lerJson(cfg.paths.estado, { concluidos: {}, falhas: {} });
-  const pendentes = duplicados.filter((g) => !estado.concluidos[g.chave]);
-  if (!pendentes.length) {
-    log('Nada a fazer — todos os grupos já foram unificados. (Apague data/estado.json para reiniciar.)');
-    return;
-  }
-
-  const lote = cfg.batchSize > 0 ? pendentes.slice(0, cfg.batchSize) : pendentes;
-  log(`Grupos pendentes: ${pendentes.length} | Neste lote: ${lote.length} | DRY_RUN=${cfg.dryRun}`);
+  const estado = lerJson(cfg.paths.estado, {
+    totalUnificados: 0,
+    pendentesMover: [], // [{ ids: [..], idNovo, nomes, quando }]
+    movidos: [],
+    falhas: [],
+  });
 
   const { browser, page } = await abrirNavegador();
-  let feitos = 0;
-  let falhas = 0;
-
   try {
-    await page.goto(cfg.listUrl, { waitUntil: 'domcontentloaded' });
-    await garantirLogado(page);
+    // Retoma movimentações pendentes de execuções anteriores
+    if (!cfg.dryRun && estado.pendentesMover.length > 0) {
+      log(`Retomando: ${estado.pendentesMover.length} leads unificados aguardando mover de funil...`);
+      await moverPendentes(page, estado);
+    }
 
-    for (const grupo of lote) {
-      try {
-        const restantes = await unificarGrupo(page, grupo);
-        if (cfg.dryRun) {
-          log(`[DRY_RUN] Grupo "${grupo.nome}" (${grupo.total} leads) — simulação ok, nada confirmado.`);
-        } else if (restantes <= 1) {
-          estado.concluidos[grupo.chave] = {
-            nome: grupo.nome,
-            leadsUnificados: grupo.total,
-            quando: new Date().toISOString(),
-          };
-          delete estado.falhas[grupo.chave];
-          feitos++;
-          log(`OK (${feitos}/${lote.length}): "${grupo.nome}" — ${grupo.total} leads unificados em 1.`);
-        } else {
-          throw new Error(`ainda restam ${restantes} leads com esse nome após as tentativas`);
-        }
-      } catch (e) {
-        falhas++;
-        estado.falhas[grupo.chave] = { nome: grupo.nome, erro: e.message, quando: new Date().toISOString() };
-        log(`FALHA no grupo "${grupo.nome}": ${e.message}`);
-        // Recarrega a lista para limpar qualquer estado de seleção/modal travado
-        await page.goto(cfg.listUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    const abriu = await abrirAssistente(page);
+    if (!abriu) {
+      log('Assistente não abriu — pode não haver mais duplicatas. Encerrando.');
+      return resumo(estado);
+    }
+
+    const limite = cfg.batchSize > 0 ? cfg.batchSize : Infinity;
+    let processadas = 0;
+
+    while (processadas < limite) {
+      const tela = await lerTela(page);
+      if (!tela) {
+        log('Assistente sem telas restantes — todas as duplicatas foram tratadas!');
+        break;
       }
+
+      const resumoTela = tela.subgrupos
+        .map((s) => `[${s.nomes.join(' + ')}] → mantém #${s.idNovo} (${s.dataNova})`)
+        .join(' | ');
+      log(`Duplicata ${tela.atual} de ${tela.total}: ${resumoTela}`);
+
+      const clicados = await selecionarMaisRecentes(page, tela);
+      log(`  ${clicados} campos apontados para o(s) lead(s) mais recente(s).`);
+
+      if (cfg.dryRun) {
+        await page.screenshot({ path: 'data/dry-run-selecao.png' }).catch(() => {});
+        log('[DRY_RUN] Seleção feita e capturada em data/dry-run-selecao.png — NADA foi unido.');
+        log('[DRY_RUN] O assistente não avança sem unir (o botão "Pular" marca como não-duplicata), então a simulação cobre 1 tela.');
+        break;
+      }
+
+      const assinaturaAntes = tela.todosIds.join(',');
+      await page.locator(sel.botaoUnir).first().click();
+
+      const avancou = await esperarProximaTela(page, assinaturaAntes);
+      for (const s of tela.subgrupos) {
+        estado.pendentesMover.push({
+          ids: s.ids,
+          idNovo: s.idNovo,
+          nomes: s.nomes,
+          quando: new Date().toISOString(),
+        });
+        estado.totalUnificados++;
+      }
+      processadas++;
       salvarJson(cfg.paths.estado, estado);
+
+      if (!avancou) {
+        log('Assistente não carregou a próxima tela (provavelmente acabaram as duplicatas).');
+        break;
+      }
       await dormir(cfg.pausaEntreGruposMs);
+    }
+
+    // Fecha o assistente sem efeitos colaterais
+    await page.locator(sel.botaoCancelar).first().click().catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
+    await dormir(800);
+
+    // FASE 2: mover leads unificados para o funil destino
+    if (!cfg.dryRun && estado.pendentesMover.length > 0) {
+      log(`FASE 2: movendo ${estado.pendentesMover.length} leads unificados para o funil ${cfg.pipelineDestino}...`);
+      await moverPendentes(page, estado);
     }
   } finally {
     salvarJson(cfg.paths.estado, estado);
     await browser.close();
   }
+  resumo(estado);
+}
 
-  const restantesTotal = duplicados.filter((g) => !estado.concluidos[g.chave]).length;
-  log('================ RESUMO DO LOTE ================');
-  log(`Unificados: ${feitos} | Falhas: ${falhas} | Grupos ainda pendentes: ${restantesTotal}`);
-  if (restantesTotal > 0 && !cfg.dryRun) log('Rode "npm run merge" novamente para o próximo lote.');
+function resumo(estado) {
+  log('================ RESUMO ================');
+  log(`Duplicatas unificadas (total acumulado): ${estado.totalUnificados}`);
+  log(`Movidos para o funil destino:            ${estado.movidos.length}`);
+  log(`Aguardando mover:                        ${estado.pendentesMover.length}`);
+  log(`Falhas registradas:                      ${estado.falhas.length}`);
   if (cfg.dryRun) log('DRY_RUN estava ativo: nada foi alterado. Defina DRY_RUN=false no .env para valer.');
+  else log('Rode "npm run merge" novamente para o próximo lote.');
+}
+
+/** Abre funil → "..." → "Localizar duplicatas". Retorna true se o assistente carregou. */
+async function abrirAssistente(page) {
+  log('Abrindo o funil e o assistente "Localizar duplicatas"...');
+  await page.goto(`${cfg.baseUrl}/leads/pipeline/`, { waitUntil: 'domcontentloaded' });
+  await dormir(5000);
+  await garantirLogado(page);
+
+  let clicouMenu = false;
+  for (const s of sel.botaoMenuMais) {
+    const btn = page.locator(s).first();
+    if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) {
+      await btn.click();
+      clicouMenu = true;
+      break;
+    }
+  }
+  if (!clicouMenu) throw new Error('botão "..." do funil não encontrado (sel.botaoMenuMais)');
+  await dormir(800);
+
+  const item = page.locator(sel.itemContextMenu, { hasText: sel.textoLocalizarDuplicatas }).first();
+  if (await item.count() === 0) throw new Error('item "Localizar duplicatas" não encontrado no menu');
+  await item.click();
+
+  try {
+    await page.waitForSelector(sel.botaoUnir, { timeout: 90000 });
+  } catch (_) {
+    return false; // sem duplicatas, o assistente pode nem abrir
+  }
+  await dormir(2500);
+  return true;
 }
 
 /**
- * Unifica um grupo até sobrar 1 lead. Retorna quantas linhas ainda existem
- * com o nome do grupo ao final.
+ * Lê a tela atual do assistente. Retorna:
+ * { atual, total, todosIds, subgrupos: [{ prefixo, idxNovo, dataNova, ids, idNovo, nomes }] }
+ * ou null se o assistente não está mais visível.
  */
-async function unificarGrupo(page, grupo) {
-  const maxRodadas = Math.ceil(grupo.total / (cfg.maxPorUnificacao - 1)) + 3;
+async function lerTela(page) {
+  const temForm = await page.locator(sel.formAssistente).first().isVisible().catch(() => false);
+  if (!temForm) return null;
 
-  for (let rodada = 0; rodada < maxRodadas; rodada++) {
-    const linhas = await buscarLinhasDoGrupo(page, grupo);
-    if (linhas.length <= 1) return linhas.length;
+  return await page.evaluate((s) => {
+    const form = document.querySelector(s.formAssistente);
+    if (!form) return null;
 
-    // Seleciona até MAX por vez, garantindo que o MAIS RECENTE (maior id) esteja incluso
-    const ordenadas = [...linhas].sort((a, b) => parseInt(b.id, 10) - parseInt(a.id, 10));
-    const selecionar = ordenadas.slice(0, cfg.maxPorUnificacao);
-    const idMaisRecente = ordenadas[0].id;
+    // contador "1 de 993"
+    let atual = null, total = null;
+    const h2 = document.querySelector(s.tituloAssistente);
+    const m = h2 ? (h2.textContent || '').match(/(\d+)\s*de\s*(\d+)/) : null;
+    if (m) { atual = parseInt(m[1], 10); total = parseInt(m[2], 10); }
 
-    log(`  "${grupo.nome}": rodada ${rodada + 1} — selecionando ${selecionar.length} de ${linhas.length} leads (mais recente: #${idMaisRecente})`);
+    // ids dos leads na ordem do DOM
+    const todosIds = Array.from(form.querySelectorAll('input[type="hidden"][name="id[]"]')).map((i) => i.value);
 
-    for (const l of selecionar) {
-      await marcarCheckbox(page, l.id);
+    // radios agrupados por name, na ordem do DOM
+    const grupos = {};
+    form.querySelectorAll('input[type="radio"]').forEach((r) => {
+      (grupos[r.name] = grupos[r.name] || []).push(r.value);
+    });
+
+    // subgrupos = grupos DATE_CREATE (na ordem), prefixo = tudo antes de "result_element"
+    const subgrupos = [];
+    let cursorIds = 0;
+    for (const [name, valores] of Object.entries(grupos)) {
+      if (!/result_element\[DATE_CREATE\]$/.test(name)) continue;
+      const prefixo = name.slice(0, name.indexOf('result_element'));
+      let idxNovo = 0;
+      valores.forEach((v, i) => { if (v > valores[idxNovo]) idxNovo = i; }); // datas ISO comparam como string
+      const ids = todosIds.slice(cursorIds, cursorIds + valores.length);
+      cursorIds += valores.length;
+      const nomes = grupos[`${prefixo}result_element[NAME]`] || [];
+      subgrupos.push({
+        prefixo,
+        idxNovo,
+        dataNova: valores[idxNovo],
+        datas: valores,
+        ids,
+        idNovo: ids[idxNovo] || null,
+        nomes,
+      });
     }
-
-    await clicarUnificar(page);
-    const confirmado = await tratarModal(page, idMaisRecente);
-
-    if (cfg.dryRun) {
-      // Em simulação, fecha o modal sem confirmar e encerra o grupo
-      await page.keyboard.press('Escape').catch(() => {});
-      await dormir(400);
-      return linhas.length;
-    }
-    if (!confirmado) throw new Error('não foi possível confirmar o modal de unificação');
-
-    await dormir(1000); // dá tempo da lista atualizar após a unificação
-  }
-
-  const finais = await buscarLinhasDoGrupo(page, grupo);
-  return finais.length;
+    if (!subgrupos.length) return null;
+    return { atual, total, todosIds, subgrupos };
+  }, { formAssistente: sel.formAssistente, tituloAssistente: sel.tituloAssistente });
 }
 
-/** Busca o nome do grupo e retorna as linhas visíveis cujo nome bate exatamente. */
-async function buscarLinhasDoGrupo(page, grupo) {
-  const busca = await primeiro(page, sel.campoBusca);
-  if (!busca) throw new Error('campo de busca não encontrado (ajuste sel.campoBusca em src/seletores.js)');
+/**
+ * Em cada subgrupo, marca em TODOS os grupos de radio a opção da coluna do
+ * lead mais recente (mesmo índice do grupo DATE_CREATE). Checkboxes (tags,
+ * e-mails, telefones) ficam como estão — a união preserva tudo.
+ * Retorna quantos radios foram clicados.
+ */
+async function selecionarMaisRecentes(page, tela) {
+  return await page.evaluate((args) => {
+    const form = document.querySelector(args.formSel);
+    if (!form) return 0;
 
-  await busca.click();
-  await busca.fill('');
-  await busca.fill(grupo.nome);
-  await busca.press('Enter');
-  await dormir(1500); // aguarda a lista filtrar
+    const grupos = {};
+    form.querySelectorAll('input[type="radio"]').forEach((r) => {
+      (grupos[r.name] = grupos[r.name] || []).push(r);
+    });
 
-  const linhas = await page.evaluate((s) => {
-    const acharLinhas = () => {
-      for (const c of s.linhaLead) {
-        const els = document.querySelectorAll(c);
-        if (els.length) return Array.from(els);
-      }
-      return [];
-    };
-    return acharLinhas().map((el) => {
-      let id = el.getAttribute('data-id');
-      let nome = '';
-      for (const c of s.nomeLead) {
-        const n = el.querySelector(c);
-        if (n) {
-          nome = (n.textContent || '').trim();
-          if (!id && n.href) {
-            const m = String(n.href).match(/\/leads\/detail\/(\d+)/);
-            if (m) id = m[1];
-          }
-          if (nome) break;
+    let clicados = 0;
+    for (const sub of args.subgrupos) {
+      for (const [name, radios] of Object.entries(grupos)) {
+        // pertence a este subgrupo? (prefixo exato antes de "result_element")
+        if (!name.startsWith(sub.prefixo + 'result_element')) continue;
+        if (sub.prefixo === '' && name.startsWith('[')) continue; // evita capturar subgrupos prefixados
+        const alvo = radios[sub.idxNovo];
+        if (alvo && !alvo.checked) {
+          alvo.click(); // dispara os handlers da Kommo (inclui sync do PIPELINE_ID oculto)
+          clicados++;
         }
       }
-      return { id, nome };
-    }).filter((l) => l.id && l.nome);
-  }, { linhaLead: sel.linhaLead, nomeLead: sel.nomeLead });
-
-  // Só linhas cujo nome normalizado bate EXATAMENTE com a chave do grupo
-  return linhas.filter((l) => normalizarNome(l.nome) === grupo.chave);
+    }
+    return clicados;
+  }, { formSel: sel.formAssistente, subgrupos: tela.subgrupos });
 }
 
-/** Marca o checkbox da linha com o data-id informado. */
-async function marcarCheckbox(page, id) {
-  for (const linhaSel of sel.linhaLead) {
-    const linha = page.locator(`${linhaSel}[data-id="${id}"]`).first();
-    if (await linha.count() === 0) continue;
+/** Espera a próxima tela do assistente (ids mudam) ou o fim. Retorna true se avançou. */
+async function esperarProximaTela(page, assinaturaAntes) {
+  const prazo = Date.now() + 45000;
+  while (Date.now() < prazo) {
+    await dormir(1200);
+    const existe = await page.locator(sel.botaoUnir).first().isVisible().catch(() => false);
+    if (!existe) return false; // assistente fechou — acabou
+    const ids = await page.evaluate((formSel) => {
+      const form = document.querySelector(formSel);
+      if (!form) return null;
+      return Array.from(form.querySelectorAll('input[type="hidden"][name="id[]"]')).map((i) => i.value).join(',');
+    }, sel.formAssistente);
+    if (ids && ids !== assinaturaAntes) return true;
+  }
+  throw new Error('tempo esgotado aguardando o assistente avançar após "Unir esta duplicata"');
+}
 
-    await linha.hover().catch(() => {});
-    for (const cbSel of sel.checkboxLinha) {
-      const cb = linha.locator(cbSel).first();
-      if (await cb.count() > 0) {
-        try {
-          if (!(await cb.isChecked().catch(() => false))) {
-            await cb.click({ force: true });
-          }
-          return;
-        } catch (_) { /* tenta o próximo candidato */ }
+/** FASE 2: move cada lead unificado para o funil destino. */
+async function moverPendentes(page, estado) {
+  const fila = [...estado.pendentesMover];
+  for (const item of fila) {
+    try {
+      const r = await moverLead(page, item);
+      if (r.ok) {
+        estado.movidos.push({ ...item, leadMovido: r.leadId, quando: new Date().toISOString() });
+        estado.pendentesMover = estado.pendentesMover.filter((p) => p !== item);
+        log(`  Lead #${r.leadId} ("${item.nomes[0] || '?'}") movido para o funil ${cfg.pipelineDestino}.`);
+      } else {
+        throw new Error(r.motivo);
       }
+    } catch (e) {
+      log(`  FALHA ao mover lead do grupo [${item.ids.join(',')}]: ${e.message} (re-tentado na próxima execução)`);
+      estado.falhas.push({ ...item, erro: e.message, quando: new Date().toISOString() });
     }
-    // Fallback: clica na área esquerda da linha (onde fica o checkbox na Kommo)
-    const box = await linha.boundingBox();
-    if (box) {
-      await page.mouse.click(box.x + 14, box.y + box.height / 2);
-      return;
-    }
+    salvarJson(cfg.paths.estado, estado);
+    await dormir(400);
   }
-  throw new Error(`não consegui marcar o checkbox do lead #${id}`);
-}
-
-/** Clica no botão de unificar (direto, dentro de "..." ou por texto). */
-async function clicarUnificar(page) {
-  await dormir(400); // barra de ações leva um instante para aparecer
-
-  // 1) Botão direto por seletor
-  let botao = await primeiro(page, sel.botaoUnificar);
-  if (botao && await botao.isVisible().catch(() => false)) {
-    await botao.click();
-    return;
-  }
-
-  // 2) Por texto na barra de ações
-  const barra = await primeiro(page, sel.barraAcoes);
-  if (barra) {
-    const porTexto = barra.locator('button, .button-input, [class*="button"]', { hasText: sel.textosUnificar }).first();
-    if (await porTexto.count() > 0) { await porTexto.click(); return; }
-  }
-
-  // 3) Dentro do menu "..."
-  const mais = await primeiro(page, sel.botaoMais);
-  if (mais && await mais.isVisible().catch(() => false)) {
-    await mais.click();
-    await dormir(300);
-    const item = page.locator('li, .button-input__context-menu__item, [class*="menu"] *', { hasText: sel.textosUnificar }).first();
-    if (await item.count() > 0) { await item.click(); return; }
-  }
-
-  // 4) Último recurso: qualquer elemento clicável visível com o texto
-  const qualquer = page.locator(':is(button, a, div, span)', { hasText: sel.textosUnificar }).first();
-  if (await qualquer.count() > 0 && await qualquer.isVisible().catch(() => false)) {
-    await qualquer.click();
-    return;
-  }
-
-  throw new Error('botão de unificar não encontrado após selecionar as linhas (ajuste src/seletores.js)');
 }
 
 /**
- * No modal de unificação, tenta priorizar os valores do lead MAIS RECENTE
- * (elementos marcados com o id dele) e confirma. Retorna true se confirmou.
+ * Descobre qual ID do grupo sobreviveu à união (tenta o mais recente primeiro)
+ * e move esse lead para o funil destino via o seletor do card.
  */
-async function tratarModal(page, idMaisRecente) {
-  const modal = await primeiro(page, sel.modalUnificacao);
-  const escopo = modal || page;
-  await dormir(600);
+async function moverLead(page, item) {
+  const candidatos = [item.idNovo, ...item.ids.filter((i) => i !== item.idNovo)];
 
-  // Prioriza valores do lead mais recente onde o modal permitir escolher
-  try {
-    const opcoes = escopo.locator(
-      `[data-id="${idMaisRecente}"], [data-lead-id="${idMaisRecente}"], input[value="${idMaisRecente}"]`
-    );
-    const n = await opcoes.count();
-    for (let i = 0; i < Math.min(n, 60); i++) {
-      await opcoes.nth(i).click({ force: true, timeout: 1500 }).catch(() => {});
+  for (const leadId of candidatos) {
+    await page.goto(`${cfg.baseUrl}/leads/detail/${leadId}`, { waitUntil: 'domcontentloaded' });
+    await dormir(3500);
+
+    // Lead existe? (card com o widget de funil e URL preservada)
+    const existe = page.url().includes(`/leads/detail/${leadId}`) &&
+      await page.locator(sel.seletorFunilCard).first().isVisible().catch(() => false);
+    if (!existe) continue;
+
+    // Já está no destino?
+    const atual = await page.evaluate((s) =>
+      document.querySelector(s)?.getAttribute('data-pipeline-id'), sel.funilAtualAttr);
+    if (String(atual) === String(cfg.pipelineDestino)) return { ok: true, leadId };
+
+    await page.locator(sel.seletorFunilCard).first().click();
+    await dormir(1200);
+
+    const selLabel = cfg.statusDestino
+      ? `label.pipeline-select__dropdown__item__label[for^="pipeline_${cfg.pipelineDestino}_${cfg.statusDestino}_"]`
+      : `label.pipeline-select__dropdown__item__label[for^="pipeline_${cfg.pipelineDestino}_"]:not([for*="_142_"]):not([for*="_143_"])`;
+    const label = page.locator(selLabel).first();
+    if (await label.count() === 0) {
+      return { ok: false, motivo: `etapa do funil ${cfg.pipelineDestino} não encontrada no dropdown do card` };
     }
-    if (n > 0) log(`  modal: ${n} campos apontados para o lead mais recente #${idMaisRecente}`);
-  } catch (_) { /* se o modal não expõe escolha por lead, segue com os padrões */ }
+    await label.scrollIntoViewIfNeeded().catch(() => {});
+    await label.click({ force: true });
+    await dormir(1800);
 
-  if (cfg.dryRun) return true;
-
-  // Confirma: primeiro por seletor conhecido, depois por texto
-  let confirmar = await primeiro(escopo, sel.botaoConfirmarModal);
-  if (!confirmar || !(await confirmar.isVisible().catch(() => false))) {
-    confirmar = escopo.locator('button, .button-input, [type="submit"]', { hasText: sel.textosUnificar }).first();
-    if (await confirmar.count() === 0) {
-      confirmar = escopo.locator('button, .button-input, [type="submit"]', { hasText: /salvar|save|confirmar|ok/i }).first();
+    // Alguns layouts pedem confirmação com "Salvar"
+    const salvar = page.locator('button, .button-input', { hasText: /^salvar$/i }).first();
+    if (await salvar.isVisible().catch(() => false)) {
+      await salvar.click();
+      await dormir(1500);
     }
-  }
-  if (!confirmar || await confirmar.count() === 0) return false;
 
-  await confirmar.click();
-
-  // Espera o modal sumir (unificação processada)
-  if (modal) {
-    await modal.waitFor({ state: 'hidden', timeout: cfg.timeoutMs }).catch(() => {});
+    const depois = await page.evaluate((s) =>
+      document.querySelector(s)?.getAttribute('data-pipeline-id'), sel.funilAtualAttr);
+    if (String(depois) === String(cfg.pipelineDestino)) return { ok: true, leadId };
+    return { ok: false, motivo: `funil não mudou (atual: ${depois})` };
   }
-  return true;
+  return { ok: false, motivo: 'nenhum dos IDs do grupo existe mais (lead resultante não localizado)' };
 }
 
 module.exports = { merge };

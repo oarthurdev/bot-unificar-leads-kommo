@@ -28,17 +28,13 @@ async function main() {
       break;
 
     case 'status': {
-      const dups = lerJson(cfg.paths.duplicados, []);
-      const estado = lerJson(cfg.paths.estado, { concluidos: {}, falhas: {} });
-      const concluidos = Object.keys(estado.concluidos).length;
-      const falhas = Object.keys(estado.falhas).length;
-      const totalLeads = dups.reduce((s, g) => s + g.total, 0);
+      const estado = lerJson(cfg.paths.estado, { totalUnificados: 0, pendentesMover: [], movidos: [], falhas: [] });
       log('=============== STATUS ===============');
-      log(`Grupos de duplicados detectados: ${dups.length} (${totalLeads} leads envolvidos)`);
-      log(`Grupos unificados:               ${concluidos}`);
-      log(`Grupos com falha:                ${falhas}`);
-      log(`Grupos pendentes:                ${dups.length - concluidos}`);
-      if (falhas > 0) log('Detalhes das falhas em data/estado.json (serão re-tentados no próximo merge).');
+      log(`Duplicatas unificadas (acumulado): ${estado.totalUnificados}`);
+      log(`Movidos para o funil ${cfg.pipelineDestino}:   ${estado.movidos.length}`);
+      log(`Aguardando mover de funil:         ${estado.pendentesMover.length}`);
+      log(`Falhas registradas:                ${estado.falhas.length}`);
+      log('O total de duplicatas restantes aparece no título do assistente a cada "npm run merge".');
       break;
     }
 
@@ -46,11 +42,12 @@ async function main() {
       console.log(`Uso: node bot.js <comando>
 
   login   Abre o navegador para login manual na Kommo (salva a sessão)
-  scan    Varre todos os leads e detecta duplicados por nome
-  merge   Unifica os duplicados em lotes (BATCH_SIZE no .env), mantendo o mais recente
+  merge   Une duplicatas pelo assistente "Localizar duplicatas" em lotes
+          (mantém o lead mais recente e move o unificado para o funil destino)
   status  Mostra o progresso da unificação
+  scan    (opcional) Varre a lista de leads e gera um relatório de duplicados por nome
 
-Fluxo: npm run login  →  npm run scan  →  npm run merge (repetir até zerar)`);
+Fluxo: npm run login  →  npm run merge (repetir até zerar)`);
   }
 }
 

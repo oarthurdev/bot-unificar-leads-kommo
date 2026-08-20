@@ -21,6 +21,11 @@ module.exports = {
   timeoutMs: parseInt(process.env.TIMEOUT_MS || '20000', 10),
   slowMo: parseInt(process.env.SLOW_MO || '0', 10),
 
+  // Destino dos leads unificados: funil "12347316" (etapa padrão = primeira etapa
+  // regular do funil; defina STATUS_DESTINO com o id da etapa para escolher outra)
+  pipelineDestino: process.env.PIPELINE_DESTINO || '12347316',
+  statusDestino: process.env.STATUS_DESTINO || '',
+
   paths: {
     dataDir: DATA_DIR,
     storageState: path.join(DATA_DIR, 'storageState.json'),
