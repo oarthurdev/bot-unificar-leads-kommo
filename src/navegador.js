@@ -61,6 +61,14 @@ async function todos(escopo, candidatos) {
   return null;
 }
 
+/** Salva os cookies atuais (a Kommo renova tokens durante o uso — persistir
+ *  ao fim de cada execução mantém a sessão viva entre execuções). */
+async function salvarSessao(context) {
+  try {
+    await context.storageState({ path: cfg.paths.storageState });
+  } catch (_) { /* sessão não salva — sem impacto na execução atual */ }
+}
+
 /** Verifica se a sessão salva ainda é válida (não caiu na tela de login). */
 async function garantirLogado(page) {
   const url = page.url();
@@ -70,4 +78,4 @@ async function garantirLogado(page) {
   return true;
 }
 
-module.exports = { abrirNavegador, primeiro, todos, garantirLogado, log };
+module.exports = { abrirNavegador, primeiro, todos, garantirLogado, salvarSessao, log };

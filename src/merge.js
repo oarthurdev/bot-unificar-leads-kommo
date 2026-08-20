@@ -1,6 +1,6 @@
 const cfg = require('./config');
 const sel = require('./seletores');
-const { abrirNavegador, garantirLogado } = require('./navegador');
+const { abrirNavegador, garantirLogado, salvarSessao } = require('./navegador');
 const { log, lerJson, salvarJson, dormir } = require('./util');
 
 /**
@@ -110,6 +110,7 @@ async function merge() {
     }
   } finally {
     salvarJson(cfg.paths.estado, estado);
+    await salvarSessao(context);
     await browser.close();
   }
   resumo(estado);

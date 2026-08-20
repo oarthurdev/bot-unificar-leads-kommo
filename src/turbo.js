@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const cfg = require('./config');
 const sel = require('./seletores');
-const { abrirNavegador, garantirLogado } = require('./navegador');
+const { abrirNavegador, garantirLogado, salvarSessao } = require('./navegador');
 const { log, lerJson, salvarJson, dormir } = require('./util');
 const { moverPendentes, abrirAssistente } = require('./merge');
 
@@ -61,6 +61,9 @@ async function turbo() {
     while (processadas < limite) {
       // 1) Próximo grupo de duplicatas
       const rd = await api.get(`${cfg.baseUrl}/ajax/v4/doubles/leads${total === null ? '?with=count' : ''}`, { headers: H });
+      if (rd.status() === 401 || rd.status() === 403) {
+        throw new Error('sessão expirou (HTTP 401) — rode "npm run login" e depois "npm run turbo" novamente');
+      }
       if (!rd.ok()) throw new Error(`doubles/leads retornou HTTP ${rd.status()}`);
       const jd = await rd.json().catch(() => null);
       if (total === null) total = jd?.total ?? 0;
@@ -164,6 +167,7 @@ async function turbo() {
     }
   } finally {
     salvarJson(cfg.paths.estado, estado);
+    await salvarSessao(context); // mantém a sessão renovada para a próxima execução
     await browser.close();
   }
 
