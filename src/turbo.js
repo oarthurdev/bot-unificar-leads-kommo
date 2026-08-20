@@ -154,8 +154,10 @@ async function turbo() {
       }
     }
 
-    // FASE 2
-    if (!cfg.dryRun && estado.pendentesMover.length > 0) {
+    // FASE 2 (SKIP_FASE2=true adia para a próxima execução)
+    if (process.env.SKIP_FASE2 === 'true') {
+      log('FASE 2 adiada (SKIP_FASE2=true) — será retomada na próxima execução.');
+    } else if (!cfg.dryRun && estado.pendentesMover.length > 0) {
       log(`FASE 2 (turbo): verificando ${estado.pendentesMover.length} grupos...`);
       await dormir(5000); // dá fôlego para a fila de uniões do servidor processar
       await fase2Turbo(api, H, context, page, estado);
