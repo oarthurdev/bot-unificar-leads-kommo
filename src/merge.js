@@ -14,12 +14,12 @@ const { log, lerJson, salvarJson, dormir } = require('./util');
  *      a coluna do lead criado MAIS RECENTEMENTE
  *   3. Clica "Unir esta duplicata" e espera a próxima tela
  *
- * Depois do lote, FASE 2: cada lead unificado é movido para o funil
- * PIPELINE_DESTINO (12347316, etapa "Deletar" por padrão).
+ * FASE 2 (após o lote): o lead MAIS RECENTE fica onde está — não é tocado.
+ * Apenas o(s) lead(s) ANTIGO(s) do grupo, se ainda existirem após a união,
+ * são movidos para o funil PIPELINE_DESTINO (12347316, etapa "Deletar").
+ * Se a união já removeu o antigo, não há nada a mover (registrado como absorvido).
  *
  * Progresso em data/estado.json (retomável). BATCH_SIZE = duplicatas por execução.
- * DRY_RUN=true: analisa e seleciona a 1ª tela SEM unir (o botão "Pular" marca o
- * par como não-duplicata permanentemente, então a simulação não avança telas).
  */
 async function merge() {
   const estado = lerJson(cfg.paths.estado, {
@@ -31,13 +31,13 @@ async function merge() {
 
   const { browser, page } = await abrirNavegador();
   try {
-    // Retoma movimentações pendentes de execuções anteriores
+    // Retoma pendências de execuções anteriores antes de unir mais
     if (!cfg.dryRun && estado.pendentesMover.length > 0) {
-      log(`Retomando: ${estado.pendentesMover.length} leads unificados aguardando mover de funil...`);
+      log(`Retomando: ${estado.pendentesMover.length} grupos aguardando tratamento pós-união...`);
       await moverPendentes(page, estado);
     }
 
-    const abriu = await abrirAssistente(page);
+    let abriu = await abrirAssistente(page);
     if (!abriu) {
       log('Assistente não abriu — pode não haver mais duplicatas. Encerrando.');
       return resumo(estado);
@@ -47,16 +47,19 @@ async function merge() {
     let processadas = 0;
 
     while (processadas < limite) {
-      const tela = await lerTela(page);
+      let tela = await lerTela(page);
       if (!tela) {
-        log('Assistente sem telas restantes — todas as duplicatas foram tratadas!');
-        break;
+        // O assistente às vezes fecha após uma união — tenta reabrir e continuar
+        abriu = await abrirAssistente(page);
+        if (!abriu) { log('Sem mais duplicatas no assistente — lote encerrado.'); break; }
+        tela = await lerTela(page);
+        if (!tela) { log('Assistente reabriu sem telas — encerrando.'); break; }
       }
 
       const resumoTela = tela.subgrupos
         .map((s) => `[${s.nomes.join(' + ')}] → mantém #${s.idNovo} (${s.dataNova})`)
         .join(' | ');
-      log(`Duplicata ${tela.atual} de ${tela.total}: ${resumoTela}`);
+      log(`Duplicata ${tela.atual} de ${tela.total} (${processadas + 1}/${limite === Infinity ? tela.total : limite} do lote): ${resumoTela}`);
 
       const clicados = await selecionarMaisRecentes(page, tela);
       log(`  ${clicados} campos apontados para o(s) lead(s) mais recente(s).`);
@@ -71,7 +74,6 @@ async function merge() {
       const assinaturaAntes = tela.todosIds.join(',');
       await page.locator(sel.botaoUnir).first().click();
 
-      const avancou = await esperarProximaTela(page, assinaturaAntes);
       for (const s of tela.subgrupos) {
         estado.pendentesMover.push({
           ids: s.ids,
@@ -84,10 +86,7 @@ async function merge() {
       processadas++;
       salvarJson(cfg.paths.estado, estado);
 
-      if (!avancou) {
-        log('Assistente não carregou a próxima tela (provavelmente acabaram as duplicatas).');
-        break;
-      }
+      await esperarProximaTela(page, assinaturaAntes);
       await dormir(cfg.pausaEntreGruposMs);
     }
 
@@ -96,9 +95,9 @@ async function merge() {
     await page.keyboard.press('Escape').catch(() => {});
     await dormir(800);
 
-    // FASE 2: mover leads unificados para o funil destino
+    // FASE 2
     if (!cfg.dryRun && estado.pendentesMover.length > 0) {
-      log(`FASE 2: movendo ${estado.pendentesMover.length} leads unificados para o funil ${cfg.pipelineDestino}...`);
+      log(`FASE 2: tratando ${estado.pendentesMover.length} grupos unificados (antigo → funil ${cfg.pipelineDestino}; o mais recente fica)...`);
       await moverPendentes(page, estado);
     }
   } finally {
@@ -111,8 +110,8 @@ async function merge() {
 function resumo(estado) {
   log('================ RESUMO ================');
   log(`Duplicatas unificadas (total acumulado): ${estado.totalUnificados}`);
-  log(`Movidos para o funil destino:            ${estado.movidos.length}`);
-  log(`Aguardando mover:                        ${estado.pendentesMover.length}`);
+  log(`Grupos tratados na fase 2:               ${estado.movidos.length}`);
+  log(`Grupos aguardando fase 2:                ${estado.pendentesMover.length}`);
   log(`Falhas registradas:                      ${estado.falhas.length}`);
   if (cfg.dryRun) log('DRY_RUN estava ativo: nada foi alterado. Defina DRY_RUN=false no .env para valer.');
   else log('Rode "npm run merge" novamente para o próximo lote.');
@@ -208,7 +207,6 @@ async function lerTela(page) {
  * Em cada subgrupo, marca em TODOS os grupos de radio a opção da coluna do
  * lead mais recente (mesmo índice do grupo DATE_CREATE). Checkboxes (tags,
  * e-mails, telefones) ficam como estão — a união preserva tudo.
- * Retorna quantos radios foram clicados.
  */
 async function selecionarMaisRecentes(page, tela) {
   return await page.evaluate((args) => {
@@ -223,7 +221,6 @@ async function selecionarMaisRecentes(page, tela) {
     let clicados = 0;
     for (const sub of args.subgrupos) {
       for (const [name, radios] of Object.entries(grupos)) {
-        // pertence a este subgrupo? (prefixo exato antes de "result_element")
         if (!name.startsWith(sub.prefixo + 'result_element')) continue;
         if (sub.prefixo === '' && name.startsWith('[')) continue; // evita capturar subgrupos prefixados
         const alvo = radios[sub.idxNovo];
@@ -237,38 +234,46 @@ async function selecionarMaisRecentes(page, tela) {
   }, { formSel: sel.formAssistente, subgrupos: tela.subgrupos });
 }
 
-/** Espera a próxima tela do assistente (ids mudam) ou o fim. Retorna true se avançou. */
+/**
+ * Espera a próxima tela do assistente após "Unir esta duplicata".
+ * O form some por alguns segundos durante o processamento, então só conclui
+ * que o assistente FECHOU depois de várias checagens seguidas sem form.
+ * Retorna true se avançou; false se o assistente fechou (o loop reabre).
+ */
 async function esperarProximaTela(page, assinaturaAntes) {
-  const prazo = Date.now() + 45000;
+  const prazo = Date.now() + 60000;
+  let semFormSeguidas = 0;
+
   while (Date.now() < prazo) {
-    await dormir(1200);
-    const existe = await page.locator(sel.botaoUnir).first().isVisible().catch(() => false);
-    if (!existe) return false; // assistente fechou — acabou
+    await dormir(1500);
     const ids = await page.evaluate((formSel) => {
       const form = document.querySelector(formSel);
       if (!form) return null;
       return Array.from(form.querySelectorAll('input[type="hidden"][name="id[]"]')).map((i) => i.value).join(',');
     }, sel.formAssistente);
-    if (ids && ids !== assinaturaAntes) return true;
+
+    if (ids && ids !== assinaturaAntes) return true;   // próxima tela carregou
+    if (ids === null || ids === '') {
+      semFormSeguidas++;
+      if (semFormSeguidas >= 5) return false;          // ~8s sem form → assistente fechou
+    } else {
+      semFormSeguidas = 0;                             // form ainda com a tela antiga (processando)
+    }
   }
   throw new Error('tempo esgotado aguardando o assistente avançar após "Unir esta duplicata"');
 }
 
-/** FASE 2: move cada lead unificado para o funil destino. */
+/** FASE 2: para cada grupo unido, move o(s) lead(s) ANTIGO(s) remanescentes. */
 async function moverPendentes(page, estado) {
   const fila = [...estado.pendentesMover];
   for (const item of fila) {
     try {
-      const r = await moverLead(page, item);
-      if (r.ok) {
-        estado.movidos.push({ ...item, leadMovido: r.leadId, quando: new Date().toISOString() });
-        estado.pendentesMover = estado.pendentesMover.filter((p) => p !== item);
-        log(`  Lead #${r.leadId} ("${item.nomes[0] || '?'}") movido para o funil ${cfg.pipelineDestino}.`);
-      } else {
-        throw new Error(r.motivo);
-      }
+      const detalhes = await tratarGrupoAposUniao(page, item);
+      estado.movidos.push({ ...item, detalhes, quando: new Date().toISOString() });
+      estado.pendentesMover = estado.pendentesMover.filter((p) => p !== item);
+      log(`  Grupo "${item.nomes.join(' + ')}": ${detalhes.map((d) => `#${d.leadId} ${d.acao}`).join('; ')}`);
     } catch (e) {
-      log(`  FALHA ao mover lead do grupo [${item.ids.join(',')}]: ${e.message} (re-tentado na próxima execução)`);
+      log(`  FALHA no grupo [${item.ids.join(',')}]: ${e.message} (re-tentado na próxima execução)`);
       estado.falhas.push({ ...item, erro: e.message, quando: new Date().toISOString() });
     }
     salvarJson(cfg.paths.estado, estado);
@@ -277,53 +282,100 @@ async function moverPendentes(page, estado) {
 }
 
 /**
- * Descobre qual ID do grupo sobreviveu à união (tenta o mais recente primeiro)
- * e move esse lead para o funil destino via o seletor do card.
+ * Regras pós-união:
+ *  - O lead MAIS RECENTE (idNovo) NUNCA é tocado.
+ *  - Se idNovo não existe mais (a união manteve outro ID), NADA é movido —
+ *    o grupo é marcado para conferência manual, por segurança.
+ *  - Cada lead antigo que ainda existir é movido para o funil destino;
+ *    os que a união já removeu são registrados como absorvidos.
  */
-async function moverLead(page, item) {
-  const candidatos = [item.idNovo, ...item.ids.filter((i) => i !== item.idNovo)];
+async function tratarGrupoAposUniao(page, item) {
+  const detalhes = [];
 
-  for (const leadId of candidatos) {
-    await page.goto(`${cfg.baseUrl}/leads/detail/${leadId}`, { waitUntil: 'domcontentloaded' });
-    await dormir(3500);
+  const novoExiste = await leadExiste(page, item.idNovo);
+  if (!novoExiste) {
+    detalhes.push({ leadId: item.idNovo, acao: 'NÃO encontrado — união manteve outro ID; nada movido (conferir manualmente)' });
+    return detalhes;
+  }
+  detalhes.push({ leadId: item.idNovo, acao: 'mais recente, mantido onde está' });
 
-    // Lead existe? (card com o widget de funil e URL preservada)
-    const existe = page.url().includes(`/leads/detail/${leadId}`) &&
-      await page.locator(sel.seletorFunilCard).first().isVisible().catch(() => false);
-    if (!existe) continue;
+  const antigos = item.ids.filter((i) => i && i !== item.idNovo);
+  for (const leadId of antigos) {
+    const existe = await leadExiste(page, leadId);
+    if (!existe) {
+      detalhes.push({ leadId, acao: 'absorvido pela união (não existe mais)' });
+      continue;
+    }
+    await moverParaFunilDestino(page, leadId); // a página já está no card do lead
+    detalhes.push({ leadId, acao: `movido para o funil ${cfg.pipelineDestino}` });
+  }
+  return detalhes;
+}
 
-    // Já está no destino?
-    const atual = await page.evaluate((s) =>
-      document.querySelector(s)?.getAttribute('data-pipeline-id'), sel.funilAtualAttr);
-    if (String(atual) === String(cfg.pipelineDestino)) return { ok: true, leadId };
+/** Abre o card do lead e verifica se ele existe (aguarda o widget de funil). */
+async function leadExiste(page, leadId) {
+  await page.goto(`${cfg.baseUrl}/leads/detail/${leadId}`, { waitUntil: 'domcontentloaded' });
+  const prazo = Date.now() + 9000;
+  while (Date.now() < prazo) {
+    if (!page.url().includes(`/leads/detail/${leadId}`)) return false; // redirecionado = não existe
+    const temWidget = await page.locator(sel.seletorFunilCard).first().isVisible().catch(() => false);
+    if (temWidget) return true;
+    await dormir(700);
+  }
+  return false;
+}
 
+/** Move o lead aberto no card para o funil destino (etapa "Deletar" por padrão). */
+async function moverParaFunilDestino(page, leadId) {
+  const atual = await page.evaluate((s) =>
+    document.querySelector(s)?.getAttribute('data-pipeline-id'), sel.funilAtualAttr);
+  if (String(atual) === String(cfg.pipelineDestino)) return; // já está lá
+
+  const selLabel = cfg.statusDestino
+    ? `label.pipeline-select__dropdown__item__label[for^="pipeline_${cfg.pipelineDestino}_${cfg.statusDestino}_"]`
+    : `label.pipeline-select__dropdown__item__label[for^="pipeline_${cfg.pipelineDestino}_"]:not([for*="_142_"]):not([for*="_143_"])`;
+
+  // Abre o dropdown (com re-tentativas) e clica na etapa destino
+  let clicou = false;
+  for (let tentativa = 0; tentativa < 3 && !clicou; tentativa++) {
     await page.locator(sel.seletorFunilCard).first().click();
-    await dormir(1200);
+    await page.waitForSelector('.pipeline-select-showed', { timeout: 5000 }).catch(() => {});
+    await dormir(800);
 
-    const selLabel = cfg.statusDestino
-      ? `label.pipeline-select__dropdown__item__label[for^="pipeline_${cfg.pipelineDestino}_${cfg.statusDestino}_"]`
-      : `label.pipeline-select__dropdown__item__label[for^="pipeline_${cfg.pipelineDestino}_"]:not([for*="_142_"]):not([for*="_143_"])`;
     const label = page.locator(selLabel).first();
     if (await label.count() === 0) {
-      return { ok: false, motivo: `etapa do funil ${cfg.pipelineDestino} não encontrada no dropdown do card` };
+      throw new Error(`etapa do funil ${cfg.pipelineDestino} não encontrada no dropdown do card do lead #${leadId}`);
     }
-    await label.scrollIntoViewIfNeeded().catch(() => {});
-    await label.click({ force: true });
-    await dormir(1800);
-
-    // Alguns layouts pedem confirmação com "Salvar"
-    const salvar = page.locator('button, .button-input', { hasText: /^salvar$/i }).first();
-    if (await salvar.isVisible().catch(() => false)) {
-      await salvar.click();
-      await dormir(1500);
+    if (await label.isVisible().catch(() => false)) {
+      await label.scrollIntoViewIfNeeded().catch(() => {});
+      await label.click();
+      clicou = true;
+    } else {
+      // Fallback: clique via JS (o handler da Kommo escuta o evento de qualquer forma)
+      try {
+        await label.evaluate((el) => el.click());
+        clicou = true;
+      } catch (_) {
+        await page.keyboard.press('Escape').catch(() => {});
+        await dormir(600);
+      }
     }
-
-    const depois = await page.evaluate((s) =>
-      document.querySelector(s)?.getAttribute('data-pipeline-id'), sel.funilAtualAttr);
-    if (String(depois) === String(cfg.pipelineDestino)) return { ok: true, leadId };
-    return { ok: false, motivo: `funil não mudou (atual: ${depois})` };
   }
-  return { ok: false, motivo: 'nenhum dos IDs do grupo existe mais (lead resultante não localizado)' };
+  if (!clicou) throw new Error(`não consegui clicar na etapa destino no card do lead #${leadId}`);
+  await dormir(1800);
+
+  // Alguns layouts pedem confirmação com "Salvar"
+  const salvar = page.locator('button, .button-input', { hasText: /^salvar$/i }).first();
+  if (await salvar.isVisible().catch(() => false)) {
+    await salvar.click();
+    await dormir(1500);
+  }
+
+  const depois = await page.evaluate((s) =>
+    document.querySelector(s)?.getAttribute('data-pipeline-id'), sel.funilAtualAttr);
+  if (String(depois) !== String(cfg.pipelineDestino)) {
+    throw new Error(`funil do lead #${leadId} não mudou (atual: ${depois})`);
+  }
 }
 
 module.exports = { merge };

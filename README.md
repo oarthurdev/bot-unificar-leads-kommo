@@ -1,25 +1,32 @@
 # Bot de Unificação de Leads Duplicados — Kommo CRM (Playwright)
 
-Bot que opera **exclusivamente pela interface web da Kommo** para unificar leads
-duplicados **em lotes**, mantendo sempre o lead **criado mais recentemente** como
-prioridade de valores. Feito para bases grandes (1000+ duplicados): sessão salva,
-recursos pesados bloqueados, progresso persistente e retomada automática.
+Bot que opera **exclusivamente pela interface web da Kommo** usando o assistente
+nativo **"Localizar duplicatas"** (menu "..." do funil), em lotes, sempre mantendo
+o lead **criado mais recentemente**. Após cada união, o lead unificado é **movido
+para o funil `12347316`** (etapa "Deletar" por padrão).
+
+Seletores calibrados contra a conta real (`dicasaindaial`) em 20/08/2026.
 
 ## Como funciona
 
 1. **`login`** — abre um navegador visível; você faz login (com 2FA, se houver) e a
-   sessão fica salva em `data/storageState.json`. Não pede login de novo até expirar.
-2. **`scan`** — abre `/leads/list/`, rola a lista até o fim, coleta `id + nome` de
-   todos os leads e agrupa duplicados por **nome normalizado** (sem acentos,
-   maiúsculas/minúsculas ou espaços extras). Gera `data/duplicados.json`.
-   - *Critério "mais recente":* os IDs da Kommo são sequenciais — **maior ID = lead
-     mais novo**. Não depende de coluna de data visível.
-3. **`merge`** — para cada grupo: busca o nome, marca os checkboxes das linhas
-   duplicadas, clica em **Unificar/Mesclar**, no modal prioriza os valores do lead
-   mais recente e confirma. Grupos grandes são unificados em rodadas de até
-   `MAX_LEADS_POR_UNIFICACAO`, sempre incluindo o lead mais novo.
-4. Progresso em `data/estado.json` — pode interromper com `Ctrl+C` e rodar de novo
-   que ele **continua de onde parou**. `BATCH_SIZE` limita quantos grupos por execução.
+   sessão fica salva em `data/storageState.json`.
+2. **`merge`** — abre o funil → "..." → **Localizar duplicatas**. Em cada tela do
+   assistente ("1 de 993"):
+   - Lê os subgrupos de duplicatas e os IDs dos leads (inputs `id[]` do form);
+   - Compara as **datas de criação** (grupo `result_element[DATE_CREATE]`) e marca,
+     em **todos** os campos (nome, data, status, responsável, orçamento…), a coluna
+     do lead **mais recente**. Tags, e-mails e telefones ficam todos marcados —
+     a união preserva tudo;
+   - Clica **"Unir esta duplicata"** e espera a próxima tela;
+   - Após o lote, **FASE 2**: abre o card de cada lead unificado e o move para o
+     funil `PIPELINE_DESTINO` pelo seletor de funil/etapa do card.
+3. Progresso em `data/estado.json` — `Ctrl+C` a qualquer momento e rode de novo:
+   ele retoma (inclusive movimentações de funil pendentes). `BATCH_SIZE` limita
+   quantas duplicatas por execução.
+
+> O botão **"Pular esta duplicata" nunca é usado** — na Kommo ele marca o par como
+> "não duplicata" permanentemente.
 
 ## Instalação
 
@@ -28,31 +35,21 @@ npm install
 npx playwright install chromium
 ```
 
-## Configuração
-
-```bash
-copy .env.example .env
-```
-
-Edite o `.env`:
+## Configuração (.env)
 
 | Variável | Descrição |
 |---|---|
 | `KOMMO_SUBDOMAIN` | Subdomínio da conta (`https://SUB.kommo.com`) |
-| `DRY_RUN` | `true` = simula sem confirmar nada (**comece assim!**) |
-| `BATCH_SIZE` | Grupos unificados por execução (`0` = todos) |
-| `MAX_LEADS_POR_UNIFICACAO` | Leads selecionados por unificação (grupos maiores → várias rodadas) |
+| `DRY_RUN` | `true` = analisa e seleciona a 1ª tela **sem unir nada** |
+| `BATCH_SIZE` | Duplicatas unificadas por execução (`0` = todas de uma vez) |
+| `PIPELINE_DESTINO` | Funil para onde o lead unificado é movido (padrão `12347316`) |
+| `STATUS_DESTINO` | Id da etapa destino (vazio = primeira etapa regular, ex.: "Deletar") |
 | `HEADLESS` | `false` para assistir o bot trabalhando |
-| `CUSTOM_LIST_URL` | URL da lista já filtrada (pipeline/etapa), se quiser restringir |
 
 ## Uso
 
 ```bash
 npm run login
-```
-
-```bash
-npm run scan
 ```
 
 ```bash
@@ -63,32 +60,29 @@ npm run merge
 npm run status
 ```
 
-**Roteiro recomendado para 1000+ duplicados:**
+**Roteiro para as ~993 duplicatas:**
 
-1. `npm run login` e `npm run scan`.
-2. Revise `data/duplicados.json` (confira se os grupos fazem sentido!).
-3. Primeiro teste: `.env` com `DRY_RUN=true`, `HEADLESS=false`, `BATCH_SIZE=3` →
-   `npm run merge` e observe o bot selecionar e abrir o modal sem confirmar.
-4. Valendo: `DRY_RUN=false`, `HEADLESS=true`, `BATCH_SIZE=100` → rode `npm run merge`
-   repetidamente (ou `BATCH_SIZE=0` para tudo de uma vez). Cada grupo leva ~5–10 s;
-   ~1000 grupos ≈ 1,5–3 h em uma execução contínua.
-5. `npm run status` a qualquer momento para ver o progresso.
+1. Teste: `DRY_RUN=true` → `npm run merge` (analisa a 1ª tela, salva
+   `data/dry-run-selecao.png` para conferência e fecha com Cancelar).
+2. Valendo: `DRY_RUN=false`, `BATCH_SIZE=100` → rode `npm run merge` repetidamente,
+   ou `BATCH_SIZE=0` para tudo de uma vez. Cada duplicata leva ~4–6 s de união
+   + ~6–8 s para mover o lead de funil (~2–4 h no total para 993).
+3. `npm run status` mostra o acumulado; o restante aparece no título do assistente.
 
 ## Se o layout da Kommo mudar
 
-Todos os seletores ficam centralizados em [`src/seletores.js`](src/seletores.js),
-como listas de candidatos (o bot usa o primeiro que existir). Se algum passo falhar
-("botão de unificar não encontrado", etc.):
+Seletores centralizados em [`src/seletores.js`](src/seletores.js), documentados
+com a estrutura real do DOM. As ferramentas de calibração estão em `tools/`
+(`inspecionar*.js` — todas somente leitura, fecham com Cancelar/Escape):
 
-1. Rode com `HEADLESS=false` e `DRY_RUN=true`;
-2. Inspecione o elemento na tela (F12) e adicione o seletor real no início da lista
-   correspondente. O restante do código não precisa mudar.
+```bash
+node tools/inspecionar-modal.js
+```
 
 ## Segurança
 
 - `DRY_RUN=true` é o padrão — nada é alterado até você desligar explicitamente.
-- Unificação na Kommo **não é reversível** em massa: valide o `duplicados.json`
-  e faça um lote pequeno de teste antes de liberar tudo.
-- Falhas não travam o lote: o grupo é registrado em `estado.json` e re-tentado
-  na próxima execução.
-- Para reprocessar do zero: apague `data/estado.json`.
+- A união de leads na Kommo **não é reversível** — confira `data/dry-run-selecao.png`
+  antes de liberar e rode um primeiro lote pequeno (`BATCH_SIZE=5`).
+- Falhas (união ou movimentação) ficam em `data/estado.json` e são re-tentadas
+  na execução seguinte, sem travar o lote.
