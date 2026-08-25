@@ -1,12 +1,8 @@
-const fs = require('fs');
-const path = require('path');
 const cfg = require('./config');
 const sel = require('./seletores');
 const { abrirNavegador, garantirLogado, salvarSessao } = require('./navegador');
 const { log, lerJson, salvarJson, dormir } = require('./util');
-const { moverPendentes, abrirAssistente } = require('./merge');
-
-const ARQUIVO_SKIP = path.join(cfg.paths.dataDir, 'skip-request.json');
+const { moverPendentes, abrirAssistente, lerTela } = require('./merge');
 
 /**
  * MODO TURBO: reproduz as requisições AJAX que o próprio assistente
@@ -56,6 +52,7 @@ async function turbo() {
     let total = null;
     let ultimoUuid = null;
     let repeticoes = 0;
+    const tentativasPulo = {}; // uuid → tentativas de pulo adiadas
     const inicio = Date.now();
 
     while (processadas < limite) {
@@ -110,9 +107,20 @@ async function turbo() {
           log('[DRY_RUN] O grupo seria pulado (marcado como "não duplicata" na Kommo). Nada foi feito.');
           break;
         }
-        await pularGrupo(api, HPOST, page, double);
-        estado.pulados.push({ ids: decisao.ids, nomes: decisao.nomes, motivo: decisao.motivo, quando: new Date().toISOString() });
-        salvarJson(cfg.paths.estado, estado);
+        const pulou = await pularGrupo(page, double);
+        if (pulou) {
+          estado.pulados.push({ ids: decisao.ids, nomes: decisao.nomes, motivo: decisao.motivo, quando: new Date().toISOString() });
+          salvarJson(cfg.paths.estado, estado);
+          delete tentativasPulo[uuid];
+        } else {
+          // assistente mostrava outro grupo — tenta de novo quando este voltar
+          tentativasPulo[uuid] = (tentativasPulo[uuid] || 0) + 1;
+          if (tentativasPulo[uuid] > 4) {
+            throw new Error(`não consegui pular o grupo [${rotulo}] após ${tentativasPulo[uuid]} tentativas — pule-o manualmente no assistente e rode de novo`);
+          }
+          ultimoUuid = null; // a repetição é nossa, não do servidor
+          await dormir(2000);
+        }
         continue;
       }
 
@@ -213,103 +221,37 @@ function decidirGrupo(double, leadsInfo) {
 }
 
 /**
- * Pula o grupo atual (equivale ao botão "Pular esta duplicata" — a Kommo marca
- * o grupo como "não duplicata" e a fila avança). Na primeira vez, captura a
- * requisição real clicando no botão pela interface; depois replica direto.
+ * Pula o grupo atual clicando no botão real "Pular esta duplicata" da
+ * interface (a Kommo marca o grupo como "não duplicata" e a fila avança).
+ * Antes de clicar, confere se o assistente está mostrando ESTE grupo —
+ * se estiver mostrando outro, não clica (retorna false) e o loop segue;
+ * o grupo volta à frente da fila mais adiante.
+ * (A versão anterior replicava a requisição AJAX do botão, mas o servidor
+ * respondia 200 sem marcar o grupo — por isso o pulo agora é sempre via UI.)
  */
-async function pularGrupo(api, HPOST, page, double) {
-  let template = fs.existsSync(ARQUIVO_SKIP) ? lerJson(ARQUIVO_SKIP, null) : null;
+async function pularGrupo(page, double) {
+  const abriu = await abrirAssistente(page);
+  if (!abriu) throw new Error('assistente não abriu para pular o grupo');
 
-  if (template) {
-    const { url, data, ehJson } = montarSkipReplay(template, double);
-    const headers = ehJson
-      ? { ...HPOST, 'content-type': 'application/json' }
-      : HPOST;
-    const r = template.metodo === 'GET'
-      ? await api.get(url, { headers })
-      : await api.post(url, { headers, data });
-    if (r.status() >= 400) throw new Error(`skip replicado falhou (HTTP ${r.status()})`);
-    await dormir(400);
-    return;
-  }
-
-  // Primeira vez: captura via interface
-  log('  (primeira pulada: capturando a requisição do botão "Pular esta duplicata"...)');
-  const capturadas = [];
-  const ouvinte = (req) => {
-    if (req.method() !== 'GET' && /doubl|merge|skip|ignore/i.test(req.url())) {
-      capturadas.push({ metodo: req.method(), url: req.url(), postData: req.postData() || '' });
-    }
-  };
-  page.on('request', ouvinte);
   try {
-    const abriu = await abrirAssistente(page);
-    if (!abriu) throw new Error('assistente não abriu para capturar o botão Pular');
+    const tela = await lerTela(page);
+    const idsAssistente = (tela?.todosIds || []).map(String).sort().join(',');
+    const idsGrupo = double.leads.map(String).concat((double.contacts || []).map(String)).sort().join(',');
+    const soLeads = double.leads.map(String).sort().join(',');
+
+    if (idsAssistente !== idsGrupo && idsAssistente !== soLeads) {
+      log(`  assistente mostra outro grupo (${idsAssistente || 'vazio'}) — pulo adiado para quando este voltar à frente da fila`);
+      return false;
+    }
+
     await page.locator(sel.botaoPular).first().click();
-    await dormir(4000);
+    await dormir(3000);
+    return true;
+  } finally {
     await page.locator(sel.botaoCancelar).first().click().catch(() => {});
     await page.keyboard.press('Escape').catch(() => {});
-  } finally {
-    page.off('request', ouvinte);
+    await dormir(500);
   }
-
-  const skipReq = capturadas.find((c) => !/\/merge\/(leads|contacts)\/info|\/merge\/leads\/save/.test(c.url));
-  if (!skipReq) throw new Error(`não capturei a requisição de pular (vistas: ${capturadas.map((c) => c.url).join(' | ') || 'nenhuma'})`);
-  fs.writeFileSync(ARQUIVO_SKIP, JSON.stringify(skipReq, null, 2), 'utf8');
-  log(`  requisição de pular capturada: ${skipReq.metodo} ${skipReq.url.slice(0, 100)}`);
-  // O clique na interface já pulou o grupo atual — nada mais a fazer.
-}
-
-/** Reconstrói a requisição de pular para o grupo atual (substitui uuids/ids). */
-function montarSkipReplay(template, double) {
-  const RE_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-  const uuids = double.group_uuids || [];
-  let url = template.url;
-  if (RE_UUID.test(url) && uuids.length) url = url.replace(RE_UUID, uuids[0]);
-
-  let data = template.postData || '';
-  const ehJson = /^\s*[{[]/.test(data);
-  if (ehJson) {
-    // corpo JSON: troca uuids e listas de ids pelo grupo atual
-    let iUuid = 0;
-    data = data.replace(RE_UUID, () => uuids[Math.min(iUuid++, Math.max(0, uuids.length - 1))] || '');
-    try {
-      const obj = JSON.parse(data);
-      const trocarIds = (o) => {
-        for (const k of Object.keys(o)) {
-          if (Array.isArray(o[k]) && o[k].every((x) => /^\d+$/.test(String(x)))) {
-            if (/lead/i.test(k) || k === 'id' || k === 'ids' || k === 'elements') o[k] = double.leads;
-            else if (/contact/i.test(k)) o[k] = double.contacts || o[k];
-          } else if (o[k] && typeof o[k] === 'object') trocarIds(o[k]);
-        }
-      };
-      trocarIds(obj);
-      data = JSON.stringify(obj);
-    } catch (_) { /* mantém a substituição só de uuids */ }
-    return { url, data, ehJson };
-  }
-  if (data) {
-    const antigos = new URLSearchParams(data);
-    const novos = new URLSearchParams();
-    let iUuid = 0;
-    for (const [k, v] of antigos) {
-      if (RE_UUID.test(String(v))) {
-        RE_UUID.lastIndex = 0;
-        novos.append(k, uuids[Math.min(iUuid++, uuids.length - 1)] || v);
-      } else if (k === 'id[]' || /\[leads\]\[\]$/.test(k)) {
-        // ids dos leads do grupo atual
-        continue; // adicionados abaixo, uma vez só
-      } else {
-        novos.append(k, v);
-      }
-      RE_UUID.lastIndex = 0;
-    }
-    if ([...new URLSearchParams(template.postData)].some(([k]) => k === 'id[]')) {
-      double.leads.forEach((id) => novos.append('id[]', String(id)));
-    }
-    data = novos.toString();
-  }
-  return { url, data, ehJson: false };
 }
 
 /** Monta o form-data do save escolhendo o lead/contato mais recente como vencedor. */
