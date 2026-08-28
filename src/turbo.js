@@ -52,12 +52,18 @@ async function turbo() {
     let total = null;
     let ultimoUuid = null;
     let repeticoes = 0;
+    let errosRedeSeguidos = 0;
     const tentativasPulo = {}; // uuid → tentativas de pulo adiadas
     const inicio = Date.now();
 
+    // Erros de rede transitórios (comuns em VPS) não devem derrubar a execução
+    const EH_TRANSITORIO = /net::ERR_|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang up|Timeout \d+ms exceeded|Navigation failed|navigating/i;
+
     while (processadas < limite) {
+     try {
       // 1) Próximo grupo de duplicatas
       const rd = await api.get(`${cfg.baseUrl}/ajax/v4/doubles/leads${total === null ? '?with=count' : ''}`, { headers: H });
+      errosRedeSeguidos = 0; // servidor respondeu — zera o contador de rede
       if (rd.status() === 401 || rd.status() === 403) {
         throw new Error('sessão expirou (HTTP 401) — rode "npm run login" e depois "npm run turbo" novamente');
       }
@@ -163,6 +169,14 @@ async function turbo() {
         const restantes = Math.max(0, total - processadas);
         log(`  >>> ${processadas} uniões (${mediaSeg.toFixed(1)}s/união) — restam ~${restantes} (~${Math.round((restantes * mediaSeg) / 60)} min)`);
       }
+     } catch (e) {
+      if (EH_TRANSITORIO.test(e.message) && ++errosRedeSeguidos <= 6) {
+        log(`Erro de rede transitório (${e.message.split('\n')[0]}) — nova tentativa em 5s (${errosRedeSeguidos}/6)...`);
+        await dormir(5000);
+        continue;
+      }
+      throw e;
+     }
     }
 
     // FASE 2 (SKIP_FASE2=true adia para a próxima execução)

@@ -129,7 +129,17 @@ function resumo(estado) {
 /** Abre funil → "..." → "Localizar duplicatas". Retorna true se o assistente carregou. */
 async function abrirAssistente(page) {
   log('Abrindo o funil e o assistente "Localizar duplicatas"...');
-  await page.goto(`${cfg.baseUrl}/leads/pipeline/`, { waitUntil: 'domcontentloaded' });
+  // re-tentativas para erros de rede transitórios (ERR_NETWORK_CHANGED etc.)
+  for (let tentativa = 1; ; tentativa++) {
+    try {
+      await page.goto(`${cfg.baseUrl}/leads/pipeline/`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      break;
+    } catch (e) {
+      if (tentativa >= 3) throw e;
+      log(`  navegação falhou (${e.message.split('\n')[0]}) — nova tentativa em 3s (${tentativa}/3)...`);
+      await dormir(3000);
+    }
+  }
   await page.waitForSelector(sel.botaoMenuMais[0], { timeout: cfg.timeoutMs }).catch(() => {});
   await dormir(1200); // handlers do menu terminam de montar
   await garantirLogado(page);
