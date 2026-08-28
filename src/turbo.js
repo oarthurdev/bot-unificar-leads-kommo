@@ -192,7 +192,6 @@ async function turbo() {
  * Regras por funil:
  *  - todos no funil de VENDAS            → pular
  *  - 2+ no funil de vendas (mas não todos) → pular (ambíguo, não mexe)
- *  - algum lead no SDR                   → pular (SDR fica onde está)
  *  - exatamente 1 no funil de vendas     → unir PARA o funil de vendas
  *  - nenhum no funil de vendas           → unir normal (mais recente vence)
  */
@@ -203,13 +202,14 @@ function decidirGrupo(double, leadsInfo) {
   const statusDe = (id) => String(leadsInfo.compare_values?.STATUS?.[id]?.values?.[0]?.value || '');
 
   const emVendas = ids.filter((id) => pipelineDe(id) === String(cfg.pipelineVendas));
-  const emSDR = ids.filter((id) => pipelineDe(id) === String(cfg.pipelineSDR));
+  const semFunil = ids.filter((id) => !pipelineDe(id));
 
+  if (semFunil.length > 0) {
+    // sem o funil de todos os leads não dá para aplicar as regras com segurança
+    return { acao: 'pular', motivo: `não identifiquei o funil de ${semFunil.map((i) => '#' + i).join(', ')} — por segurança, não mexer`, ids, nomes };
+  }
   if (emVendas.length === ids.length) {
     return { acao: 'pular', motivo: 'todos os leads já estão no funil de vendas', ids, nomes };
-  }
-  if (emSDR.length > 0) {
-    return { acao: 'pular', motivo: `lead(s) no funil SDR (${emSDR.map((i) => '#' + i).join(', ')}) — ficam onde estão`, ids, nomes };
   }
   if (emVendas.length === 1) {
     return { acao: 'unir-vendas', idVendas: emVendas[0], statusVendas: statusDe(emVendas[0]), ids, nomes };
