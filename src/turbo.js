@@ -2,7 +2,7 @@ const cfg = require('./config');
 const sel = require('./seletores');
 const { abrirNavegador, garantirLogado, salvarSessao } = require('./navegador');
 const { log, lerJson, salvarJson, dormir } = require('./util');
-const { moverPendentes, abrirAssistente, lerTela } = require('./merge');
+const { abrirAssistente, lerTela } = require('./merge');
 
 /**
  * MODO TURBO: reproduz as requisições AJAX que o próprio assistente
@@ -18,9 +18,10 @@ const { moverPendentes, abrirAssistente, lerTela } = require('./merge');
  * (result_element[ID] = vencedor; campos preferem o valor do vencedor;
  * tags/e-mails/telefones são unidos). ~1-2s por união em vez de ~8s.
  *
- * FASE 2 acelerada: existência verificada por requisição (~0,2s por lead);
- * a UI só é usada no caso raro de um lead antigo sobreviver e precisar
- * ser movido para o funil destino.
+ * SÓ UNIFICAÇÃO: o turbo não tem fase 2. Roda até esvaziar a fila de
+ * duplicatas (ignora BATCH_SIZE) e se recupera sozinho de erros de rede,
+ * uniões recusadas e travas da fila. Só para de verdade se a sessão expirar
+ * ou se ficar 20 minutos sem conseguir progresso algum.
  */
 async function turbo() {
   const estado = lerJson(cfg.paths.estado, {
@@ -47,12 +48,14 @@ async function turbo() {
     await dormir(1500);
     await garantirLogado(page);
 
-    const limite = cfg.batchSize > 0 ? cfg.batchSize : Infinity;
+    const limite = Infinity; // turbo sempre roda até esvaziar a fila
     let processadas = 0;
     let total = null;
     let ultimoUuid = null;
     let repeticoes = 0;
     let errosRedeSeguidos = 0;
+    let ultimoProgresso = Date.now(); // última união ou pulo bem-sucedido
+    const SEM_PROGRESSO_MAX_MS = 20 * 60 * 1000;
     const tentativasPulo = {}; // uuid → tentativas de pulo adiadas
     const inicio = Date.now();
 
@@ -60,6 +63,9 @@ async function turbo() {
     const EH_TRANSITORIO = /net::ERR_|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang up|Timeout \d+ms exceeded|Navigation failed|navigating/i;
 
     while (processadas < limite) {
+      if (Date.now() - ultimoProgresso > SEM_PROGRESSO_MAX_MS) {
+        throw new Error('20 minutos sem nenhum progresso (nenhuma união ou pulo) — verifique a conta e rode novamente');
+      }
      try {
       // 1) Próximo grupo de duplicatas
       const rd = await api.get(`${cfg.baseUrl}/ajax/v4/doubles/leads${total === null ? '?with=count' : ''}`, { headers: H });
@@ -80,7 +86,12 @@ async function turbo() {
       if (uuid && uuid === ultimoUuid) {
         // servidor ainda processando a união anterior — aguarda e tenta de novo
         repeticoes++;
-        if (repeticoes >= 8) throw new Error('o mesmo grupo voltou 8 vezes — o servidor não está processando as uniões; aguarde alguns minutos e rode novamente');
+        if (repeticoes >= 8) {
+          log('O mesmo grupo voltou 8 vezes — dando 30s para a fila do servidor processar...');
+          repeticoes = 0;
+          await dormir(30000);
+          continue;
+        }
         await dormir(2000);
         continue;
       }
@@ -118,11 +129,14 @@ async function turbo() {
           estado.pulados.push({ ids: decisao.ids, nomes: decisao.nomes, motivo: decisao.motivo, quando: new Date().toISOString() });
           salvarJson(cfg.paths.estado, estado);
           delete tentativasPulo[uuid];
+          ultimoProgresso = Date.now();
         } else {
           // assistente mostrava outro grupo — tenta de novo quando este voltar
           tentativasPulo[uuid] = (tentativasPulo[uuid] || 0) + 1;
           if (tentativasPulo[uuid] > 4) {
-            throw new Error(`não consegui pular o grupo [${rotulo}] após ${tentativasPulo[uuid]} tentativas — pule-o manualmente no assistente e rode de novo`);
+            log(`  pulo do grupo [${rotulo}] falhou ${tentativasPulo[uuid]}x — aguardando 30s antes de insistir...`);
+            tentativasPulo[uuid] = 0;
+            await dormir(30000);
           }
           ultimoUuid = null; // a repetição é nossa, não do servidor
           await dormir(2000);
@@ -152,16 +166,21 @@ async function turbo() {
         await dormir(2000);
         sr = await api.post(`${cfg.baseUrl}/ajax/merge/leads/save`, { headers: HPOST, data: params.toString() });
         if (sr.status() !== 202 && sr.status() !== 200) {
+          // registra a falha e PULA o grupo para a fila não travar
           const corpo = (await sr.text().catch(() => '')).slice(0, 300);
           estado.falhas.push({ ids, idNovo, nomes, erro: `save HTTP ${sr.status()}: ${corpo}`, quando: new Date().toISOString() });
           salvarJson(cfg.paths.estado, estado);
-          throw new Error(`união recusada pelo servidor (HTTP ${sr.status()}). Interrompido por segurança — veja data/estado.json`);
+          log(`  união recusada pelo servidor (HTTP ${sr.status()}) — registrada em estado.json; pulando o grupo para continuar...`);
+          const pulou = await pularGrupo(page, double).catch(() => false);
+          if (pulou) ultimoProgresso = Date.now();
+          continue;
         }
       }
 
       estado.pendentesMover.push({ ids, idNovo, nomes, quando: new Date().toISOString() });
       estado.totalUnificados++;
       processadas++;
+      ultimoProgresso = Date.now();
       salvarJson(cfg.paths.estado, estado);
 
       if (processadas % 25 === 0) {
@@ -170,22 +189,16 @@ async function turbo() {
         log(`  >>> ${processadas} uniões (${mediaSeg.toFixed(1)}s/união) — restam ~${restantes} (~${Math.round((restantes * mediaSeg) / 60)} min)`);
       }
      } catch (e) {
-      if (EH_TRANSITORIO.test(e.message) && ++errosRedeSeguidos <= 6) {
-        log(`Erro de rede transitório (${e.message.split('\n')[0]}) — nova tentativa em 5s (${errosRedeSeguidos}/6)...`);
-        await dormir(5000);
+      if (EH_TRANSITORIO.test(e.message)) {
+        // nunca desiste por rede: espera 5s nas primeiras 6, depois 30s por vez
+        errosRedeSeguidos++;
+        const espera = errosRedeSeguidos <= 6 ? 5000 : 30000;
+        log(`Erro de rede transitório (${e.message.split('\n')[0]}) — nova tentativa em ${espera / 1000}s (${errosRedeSeguidos})...`);
+        await dormir(espera);
         continue;
       }
       throw e;
      }
-    }
-
-    // FASE 2 (SKIP_FASE2=true adia para a próxima execução)
-    if (process.env.SKIP_FASE2 === 'true') {
-      log('FASE 2 adiada (SKIP_FASE2=true) — será retomada na próxima execução.');
-    } else if (!cfg.dryRun && estado.pendentesMover.length > 0) {
-      log(`FASE 2 (turbo): verificando ${estado.pendentesMover.length} grupos...`);
-      await dormir(5000); // dá fôlego para a fila de uniões do servidor processar
-      await fase2Turbo(api, H, context, page, estado);
     }
   } finally {
     salvarJson(cfg.paths.estado, estado);
@@ -196,8 +209,6 @@ async function turbo() {
   log('================ RESUMO ================');
   log(`Duplicatas unificadas (total acumulado): ${estado.totalUnificados}`);
   log(`Grupos pulados pelas regras de funil:    ${estado.pulados.length}`);
-  log(`Grupos tratados na fase 2:               ${estado.movidos.length}`);
-  log(`Grupos aguardando fase 2:                ${estado.pendentesMover.length}`);
   log(`Falhas registradas:                      ${estado.falhas.length}`);
   if (cfg.dryRun) log('DRY_RUN estava ativo: nada foi alterado.');
 }
@@ -350,59 +361,6 @@ function decodeHtml(s) {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
-}
-
-/**
- * FASE 2 turbo: existência via /api/v4/leads/{id} (sessão web autoriza).
- * Grupos onde tudo foi absorvido são resolvidos sem abrir a UI; os raros
- * casos com lead antigo sobrevivente vão para a rotina de UI (moverPendentes).
- */
-async function fase2Turbo(api, H, context, page, estado) {
-  let apiOk = true;
-
-  const existeLead = async (id) => {
-    const r = await api.get(`${cfg.baseUrl}/api/v4/leads/${id}`, { headers: H }).catch(() => null);
-    if (!r) return null;
-    if (r.status() === 200) return true;
-    if (r.status() === 404 || r.status() === 204) return false;
-    if (r.status() === 401 || r.status() === 403) { apiOk = false; return null; }
-    return null;
-  };
-
-  const fila = [...estado.pendentesMover];
-  let resolvidosRapido = 0;
-
-  for (const item of fila) {
-    if (!apiOk) break;
-    const novoExiste = await existeLead(item.idNovo);
-    if (novoExiste !== true) continue; // deixa para a rotina de UI decidir
-
-    const antigos = item.ids.filter((i) => i !== item.idNovo);
-    const checagens = await Promise.all(antigos.map((a) => existeLead(a)));
-    if (checagens.every((c) => c === false)) {
-      estado.movidos.push({
-        ...item,
-        detalhes: [
-          { leadId: item.idNovo, acao: 'mais recente, mantido onde está' },
-          ...antigos.map((a) => ({ leadId: a, acao: 'absorvido pela união (não existe mais)' })),
-        ],
-        quando: new Date().toISOString(),
-      });
-      estado.pendentesMover = estado.pendentesMover.filter((x) => x !== item);
-      resolvidosRapido++;
-      if (resolvidosRapido % 50 === 0) {
-        salvarJson(cfg.paths.estado, estado);
-        log(`  fase 2 rápida: ${resolvidosRapido} grupos confirmados (absorvidos)...`);
-      }
-    }
-    // se algum antigo sobreviveu (ou está em processamento), fica em pendentesMover
-  }
-  salvarJson(cfg.paths.estado, estado);
-  log(`  fase 2 rápida: ${resolvidosRapido} grupos resolvidos sem UI; ${estado.pendentesMover.length} restantes para a rotina completa.`);
-
-  if (estado.pendentesMover.length > 0) {
-    await moverPendentes(context, page, estado);
-  }
 }
 
 module.exports = { turbo };
