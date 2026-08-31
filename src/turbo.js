@@ -54,6 +54,7 @@ async function turbo() {
     let ultimoUuid = null;
     let repeticoes = 0;
     let errosRedeSeguidos = 0;
+    let filaVazia = 0; // confirmações seguidas de fila+contador zerados
     let ultimoProgresso = Date.now(); // última união ou pulo bem-sucedido
     const SEM_PROGRESSO_MAX_MS = 20 * 60 * 1000;
     const tentativasPulo = {}; // uuid → tentativas de pulo adiadas
@@ -78,9 +79,30 @@ async function turbo() {
       if (total === null) total = jd?.total ?? 0;
       const double = jd?.double;
       if (!double || !Array.isArray(double.leads) || double.leads.length < 2) {
+        // O save é ASSÍNCRONO (202 = fila do servidor): logo após uma união a
+        // fila de duplicatas fica momentaneamente vazia enquanto reprocessa.
+        // Só encerra depois de confirmar 3x, com pausa, que o CONTADOR oficial
+        // também está zerado.
+        const rc = await api.get(`${cfg.baseUrl}/ajax/v4/doubles/leads?with=count`, { headers: H });
+        const jc = await rc.json().catch(() => null);
+        const totalAgora = jc?.total ?? 0;
+        if (totalAgora > 0) {
+          total = totalAgora + processadas; // mantém o "restam ~" coerente
+          filaVazia = 0;
+          log(`Fila momentaneamente vazia, mas o contador mostra ${totalAgora} duplicatas — aguardando o servidor processar...`);
+          await dormir(6000);
+          continue;
+        }
+        filaVazia++;
+        if (filaVazia < 3) {
+          log(`Fila e contador vazios — confirmando (${filaVazia}/3)...`);
+          await dormir(5000);
+          continue;
+        }
         log('Não há mais duplicatas na fila — concluído!');
         break;
       }
+      filaVazia = 0;
 
       const uuid = (double.group_uuids || []).join(',');
       if (uuid && uuid === ultimoUuid) {
